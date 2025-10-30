@@ -110,7 +110,8 @@ impl Adapter for AnthropicAdapter {
 		let (model_name, _) = model.model_name.as_model_name_and_namespace();
 		let supports_thinking = model_name.contains("claude-opus-4")
 			|| model_name.contains("claude-sonnet-4")
-			|| model_name.contains("claude-3-7-sonnet");
+			|| model_name.contains("claude-3-7-sonnet")
+			|| model_name.contains("claude-haiku-4-5");
 
 		let thinking_enabled = if supports_thinking {
 			match options_set.reasoning_effort() {
@@ -150,7 +151,10 @@ impl Adapter for AnthropicAdapter {
 		// -- Calculate max_tokens first (required for Anthropic)
 		let max_tokens = options_set.max_tokens().unwrap_or_else(|| {
 			// most likely models used, so put first. Also a little wider with `claude-sonnet` (since name from version 4)
-			if model_name.contains("claude-sonnet") || model_name.contains("claude-3-7-sonnet") {
+			if model_name.contains("claude-sonnet")
+				|| model_name.contains("claude-3-7-sonnet")
+				|| model_name.contains("claude-haiku-4-5")
+			{
 				MAX_TOKENS_64K
 			} else if model_name.contains("claude-opus-4") {
 				MAX_TOKENS_32K

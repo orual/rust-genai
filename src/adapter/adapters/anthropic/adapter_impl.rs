@@ -25,10 +25,15 @@ const REASONING_HIGH: u32 = 24000;
 
 // NOTE: For now, those are opt-ins, but should become opt-out when well supported.
 // see: effort doc: https://platform.claude.com/docs/en/build-with-claude/effort
-const SUPPORT_EFFORT_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
-const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-6"];
+// NOTE (pattern fork patch): the `claude-opus-4-7` entries below are added ahead
+// of upstream so pattern's primary model gets the same reasoning/adaptive-thinking
+// treatment as 4-6. Drop them when upstream catches up. Sonnet 4.7 has not yet
+// shipped — revisit when it does. Tracked in REBASE_NOTES_v3_foundation.md.
+const SUPPORT_EFFORT_MODELS: &[&str] =
+	&["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
+const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-7", "claude-opus-4-6"];
 // see:adaptive thinking: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
-const SUPPORT_ADAPTTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-6", "claude-sonnet-4-6"];
+const SUPPORT_ADAPTTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
 
 fn has_model(model_prefixes: &[&str], model_name: &str) -> bool {
 	model_prefixes.iter().any(|prefix| model_name.contains(prefix))
@@ -1207,6 +1212,39 @@ mod tests {
 		// Legacy path with no cache_control on any system renders as a plain string,
 		// not an array.
 		assert_eq!(system, json!("legacy-system"));
+	}
+
+	// -- Task 4 fork patch: Opus 4.7 routing
+
+	/// Regression guard: `claude-opus-4-7` must land in every reasoning-support
+	/// array (effort, reasoning-max, adaptive-thinking). If upstream eventually
+	/// adds its own entries and the fork-patch line is dropped, the assertions
+	/// still hold via the upstream definitions.
+	#[test]
+	fn test_opus_4_7_reasoning_support_arrays() {
+		assert!(
+			has_model(SUPPORT_EFFORT_MODELS, "claude-opus-4-7"),
+			"claude-opus-4-7 must be in SUPPORT_EFFORT_MODELS"
+		);
+		assert!(
+			has_model(SUPPORT_REASONING_MAX_MODELS, "claude-opus-4-7"),
+			"claude-opus-4-7 must be in SUPPORT_REASONING_MAX_MODELS"
+		);
+		assert!(
+			has_model(SUPPORT_ADAPTTIVE_THINK_MODELS, "claude-opus-4-7"),
+			"claude-opus-4-7 must be in SUPPORT_ADAPTTIVE_THINK_MODELS"
+		);
+	}
+
+	/// `ANTHROPIC_VERSION` is still the current stable API version per
+	/// claude-code + cliproxy (2023-06-01). This test pins the value; if a
+	/// future upstream bump is desired, update this assertion deliberately.
+	#[test]
+	fn test_anthropic_version_constant_pinned() {
+		assert_eq!(
+			ANTHROPIC_VERSION, "2023-06-01",
+			"ANTHROPIC_VERSION bump should be a deliberate decision"
+		);
 	}
 }
 

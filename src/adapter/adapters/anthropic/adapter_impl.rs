@@ -4,7 +4,7 @@ use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, CacheControl, CacheCreationDetails, ChatOptionsSet, ChatRequest, ChatResponse,
 	ChatResponseFormat, ChatRole, ChatStream, ChatStreamResponse, ContentPart, MessageContent, PromptTokensDetails,
-	ReasoningEffort, StopReason, Tool, ToolCall, ToolConfig, ToolName, Usage,
+	ReasoningEffort, StopReason, SystemBlock, Tool, ToolCall, ToolConfig, ToolName, Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{EventSourceStream, WebResponse};
@@ -554,10 +554,19 @@ impl AnthropicAdapter {
 		// Track TTL ordering for validation (1h must come before 5m)
 		let mut seen_5m_cache = false;
 
+		// `system_blocks`, when present, is authoritative — it fully replaces
+		// `chat_req.system` and any `ChatRole::System` messages for system-
+		// prompt construction. Callers using `system_blocks` are taking explicit
+		// control over system-prompt shape (per-block cache_control, ordering).
+		let explicit_system_blocks: Option<Vec<SystemBlock>> = chat_req.system_blocks;
+		let use_explicit_blocks = explicit_system_blocks.is_some();
+
 		// NOTE: For now, this means the first System cannot have a cache control
 		//       so that we do not change too much.
-		if let Some(system) = chat_req.system {
-			systems.push((system, None));
+		if !use_explicit_blocks {
+			if let Some(system) = chat_req.system {
+				systems.push((system, None));
+			}
 		}
 
 		// -- Process the messages
@@ -584,9 +593,13 @@ impl AnthropicAdapter {
 
 			match msg.role {
 				// Collect only text for system; other content parts are ignored by Anthropic here.
+				// When explicit `system_blocks` are set, they are authoritative and
+				// system-role messages are dropped from system-prompt construction.
 				ChatRole::System => {
-					if let Some(system_text) = msg.content.joined_texts() {
-						systems.push((system_text, cache_control));
+					if !use_explicit_blocks {
+						if let Some(system_text) = msg.content.joined_texts() {
+							systems.push((system_text, cache_control));
+						}
 					}
 				}
 
@@ -750,7 +763,27 @@ impl AnthropicAdapter {
 
 		// -- Create the Anthropic system
 		// NOTE: Anthropic does not have a "role": "system", just a single optional system property
-		let system = if !systems.is_empty() {
+		let system = if let Some(blocks) = explicit_system_blocks {
+			// Explicit `system_blocks` path: always emit array shape, honouring
+			// each block's cache_control verbatim. Empty vec → no system at all
+			// (caller explicitly asked for no system prompt).
+			if blocks.is_empty() {
+				None
+			} else {
+				let parts: Vec<Value> = blocks
+					.iter()
+					.map(|block| match &block.cache_control {
+						Some(cc) => json!({
+							"type": "text",
+							"text": block.text,
+							"cache_control": cache_control_to_json(cc),
+						}),
+						None => json!({"type": "text", "text": block.text}),
+					})
+					.collect();
+				Some(json!(parts))
+			}
+		} else if !systems.is_empty() {
 			let has_any_cache = systems.iter().any(|(_, cc)| cc.is_some());
 			let system: Value = if has_any_cache {
 				// Build multi-part system with per-part cache_control
@@ -1069,6 +1102,111 @@ mod tests {
 		let cache_creation = json!({});
 		let result = parse_cache_creation_details(&cache_creation);
 		assert!(result.is_none());
+	}
+
+	// -- system_blocks path (Task 3 fork patch)
+
+	use crate::chat::{ChatMessage, SystemBlock};
+
+	/// Single explicit `SystemBlock` without cache_control still renders as an
+	/// array (caller asked for explicit control — we honour it verbatim).
+	#[test]
+	fn test_system_blocks_single_no_cache_renders_array() {
+		let req = ChatRequest::from_user("hi").with_system_blocks(vec![SystemBlock::new("you are helpful")]);
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
+		let system = parts.system.expect("system must be present");
+
+		let arr = system.as_array().expect("system must be an array when blocks are used");
+		assert_eq!(arr.len(), 1);
+		assert_eq!(arr[0], json!({"type": "text", "text": "you are helpful"}));
+		assert!(arr[0].get("cache_control").is_none(), "no cache_control expected");
+	}
+
+	/// Multiple blocks with per-block cache_control, including mixed TTLs in the
+	/// 1h-before-5m order Anthropic requires. Each block must render its own
+	/// `cache_control` entry.
+	#[test]
+	fn test_system_blocks_multiple_with_mixed_ttls() {
+		let req = ChatRequest::from_user("hi").with_system_blocks(vec![
+			SystemBlock::new("stable identity").with_cache_control(CacheControl::Ephemeral1h),
+			SystemBlock::new("less stable base"),
+			SystemBlock::new("volatile state").with_cache_control(CacheControl::Ephemeral5m),
+		]);
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
+		let system = parts.system.expect("system present");
+		let arr = system.as_array().expect("array");
+
+		assert_eq!(arr.len(), 3);
+		assert_eq!(
+			arr[0],
+			json!({
+				"type": "text",
+				"text": "stable identity",
+				"cache_control": {"type": "ephemeral", "ttl": "1h"},
+			}),
+		);
+		assert_eq!(arr[1], json!({"type": "text", "text": "less stable base"}));
+		assert!(arr[1].get("cache_control").is_none(), "middle block has no cache_control");
+		assert_eq!(
+			arr[2],
+			json!({
+				"type": "text",
+				"text": "volatile state",
+				"cache_control": {"type": "ephemeral", "ttl": "5m"},
+			}),
+		);
+	}
+
+	/// `system_blocks` is authoritative: when set, `chat_req.system` is ignored,
+	/// as are any `ChatRole::System` messages. Caller has full control.
+	#[test]
+	fn test_system_blocks_overrides_system_string_and_system_messages() {
+		let req = ChatRequest::new(vec![
+			ChatMessage::system("ignored system message"),
+			ChatMessage::user("real user turn"),
+		])
+		.with_system("ignored system string")
+		.with_system_blocks(vec![SystemBlock::new("only this wins")]);
+
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
+		let system = parts.system.expect("system present");
+		let arr = system.as_array().expect("array");
+
+		assert_eq!(arr.len(), 1);
+		assert_eq!(arr[0].get("text").and_then(|v| v.as_str()), Some("only this wins"));
+
+		// And the user turn should still be in messages (system messages dropped but
+		// user messages preserved).
+		let user_msgs: Vec<_> = parts
+			.messages
+			.iter()
+			.filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+			.collect();
+		assert_eq!(user_msgs.len(), 1, "user message must survive");
+	}
+
+	/// Explicit empty `system_blocks` vec → no system field emitted (caller
+	/// actively asked for no system prompt).
+	#[test]
+	fn test_system_blocks_empty_vec_produces_no_system() {
+		let req = ChatRequest::from_user("hi")
+			.with_system("ignored")
+			.with_system_blocks(Vec::<SystemBlock>::new());
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
+		assert!(parts.system.is_none(), "empty system_blocks means no system");
+	}
+
+	/// Without `system_blocks`, the existing system-string + system-message
+	/// behaviour must be preserved (regression guard for the unchanged path).
+	#[test]
+	fn test_system_blocks_none_preserves_legacy_behaviour() {
+		let req = ChatRequest::from_user("hi").with_system("legacy-system");
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
+		let system = parts.system.expect("legacy system present");
+
+		// Legacy path with no cache_control on any system renders as a plain string,
+		// not an array.
+		assert_eq!(system, json!("legacy-system"));
 	}
 }
 

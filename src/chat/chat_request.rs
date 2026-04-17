@@ -1,8 +1,62 @@
 //! This module contains all the types related to a Chat Request (except ChatOptions, which has its own file).
 
-use crate::chat::{ChatMessage, ChatRole, StreamEnd, Tool, ToolCall, ToolResponse};
+use crate::chat::{CacheControl, ChatMessage, ChatRole, StreamEnd, Tool, ToolCall, ToolResponse};
 use crate::support;
 use serde::{Deserialize, Serialize};
+
+// region:    --- SystemBlock
+
+/// A system-prompt block with optional per-block cache_control.
+///
+/// Used by callers who need explicit control over the ordering and cache-control
+/// markers on individual system-prompt segments (e.g. a three-segment cache layout
+/// where segment 1 is stable identity with a long TTL and segment 3 is volatile
+/// state with a shorter TTL).
+///
+/// **Adapter support:** currently consumed by the Anthropic adapter. Other adapters
+/// ignore `ChatRequest::system_blocks` and fall back to `ChatRequest::system`; if a
+/// caller wants a system prompt rendered for non-Anthropic providers, they should
+/// set `system` explicitly alongside `system_blocks`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemBlock {
+	/// The text content of this system block.
+	pub text: String,
+
+	/// Optional cache-control marker for this block. When set, Anthropic emits a
+	/// per-block `cache_control` entry in the system-prompt array.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub cache_control: Option<CacheControl>,
+}
+
+impl SystemBlock {
+	/// Construct a plain system block with no cache_control marker.
+	pub fn new(text: impl Into<String>) -> Self {
+		Self {
+			text: text.into(),
+			cache_control: None,
+		}
+	}
+
+	/// Builder-style setter for the cache-control marker.
+	pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+		self.cache_control = Some(cache_control);
+		self
+	}
+}
+
+impl From<&str> for SystemBlock {
+	fn from(text: &str) -> Self {
+		Self::new(text)
+	}
+}
+
+impl From<String> for SystemBlock {
+	fn from(text: String) -> Self {
+		Self::new(text)
+	}
+}
+
+// endregion: --- SystemBlock
 
 // region:    --- ChatRequest
 
@@ -11,6 +65,14 @@ use serde::{Deserialize, Serialize};
 pub struct ChatRequest {
 	/// The initial system content of the request.
 	pub system: Option<String>,
+
+	/// Optional per-block system prompts with independent cache_control markers.
+	///
+	/// When set, Anthropic uses these blocks verbatim as the system-prompt array
+	/// and **ignores** both `system` and any `ChatRole::System` messages. Other
+	/// adapters currently ignore this field; see [`SystemBlock`] for details.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub system_blocks: Option<Vec<SystemBlock>>,
 
 	/// The messages of the request.
 	#[serde(default)]
@@ -39,6 +101,7 @@ impl ChatRequest {
 		Self {
 			messages,
 			system: None,
+			system_blocks: None,
 			tools: None,
 			previous_response_id: None,
 			store: None,
@@ -49,6 +112,7 @@ impl ChatRequest {
 	pub fn from_system(content: impl Into<String>) -> Self {
 		Self {
 			system: Some(content.into()),
+			system_blocks: None,
 			messages: Vec::new(),
 			tools: None,
 			previous_response_id: None,
@@ -60,6 +124,7 @@ impl ChatRequest {
 	pub fn from_user(content: impl Into<String>) -> Self {
 		Self {
 			system: None,
+			system_blocks: None,
 			messages: vec![ChatMessage::user(content.into())],
 			tools: None,
 			previous_response_id: None,
@@ -71,6 +136,7 @@ impl ChatRequest {
 	pub fn from_messages(messages: Vec<ChatMessage>) -> Self {
 		Self {
 			system: None,
+			system_blocks: None,
 			messages,
 			tools: None,
 			previous_response_id: None,
@@ -84,6 +150,20 @@ impl ChatRequest {
 	/// Set or replace the system prompt.
 	pub fn with_system(mut self, system: impl Into<String>) -> Self {
 		self.system = Some(system.into());
+		self
+	}
+
+	/// Set or replace the per-block system prompts.
+	///
+	/// When set, the Anthropic adapter uses these blocks as the sole source for
+	/// the system prompt — `system` and `ChatRole::System` messages are ignored
+	/// for that adapter. Other adapters continue to read from `system`.
+	pub fn with_system_blocks<I>(mut self, blocks: I) -> Self
+	where
+		I: IntoIterator,
+		I::Item: Into<SystemBlock>,
+	{
+		self.system_blocks = Some(blocks.into_iter().map(Into::into).collect());
 		self
 	}
 
@@ -192,6 +272,7 @@ impl From<Vec<ChatMessage>> for ChatRequest {
 	fn from(messages: Vec<ChatMessage>) -> Self {
 		Self {
 			system: None,
+			system_blocks: None,
 			messages,
 			tools: None,
 			previous_response_id: None,

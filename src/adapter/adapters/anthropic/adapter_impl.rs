@@ -29,8 +29,7 @@ const REASONING_HIGH: u32 = 24000;
 // of upstream so pattern's primary model gets the same reasoning/adaptive-thinking
 // treatment as 4-6. Drop them when upstream catches up. Sonnet 4.7 has not yet
 // shipped — revisit when it does. Tracked in REBASE_NOTES_v3_foundation.md.
-const SUPPORT_EFFORT_MODELS: &[&str] =
-	&["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
+const SUPPORT_EFFORT_MODELS: &[&str] = &["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-opus-4-5"];
 const SUPPORT_REASONING_MAX_MODELS: &[&str] = &["claude-opus-4-7", "claude-opus-4-6"];
 // see:adaptive thinking: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 const SUPPORT_ADAPTTIVE_THINK_MODELS: &[&str] = &["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"];
@@ -1151,7 +1150,10 @@ mod tests {
 			}),
 		);
 		assert_eq!(arr[1], json!({"type": "text", "text": "less stable base"}));
-		assert!(arr[1].get("cache_control").is_none(), "middle block has no cache_control");
+		assert!(
+			arr[1].get("cache_control").is_none(),
+			"middle block has no cache_control"
+		);
 		assert_eq!(
 			arr[2],
 			json!({

@@ -85,8 +85,10 @@ impl Stream for WebStream {
 						let status = response.status();
 						if !status.is_success() {
 							this.response_future = None;
-							// For error responses, we need to read the body to get the error message
-							// Store a future that reads the body and returns an error
+							// Capture headers BEFORE consuming the response body —
+							// callers need them for rate-limit reset, request-id,
+							// retry-after, etc.
+							let headers = Box::new(response.headers().clone());
 							let error_future = async move {
 								let body = response
 									.text()
@@ -96,6 +98,7 @@ impl Stream for WebStream {
 									status,
 									canonical_reason: status.canonical_reason().unwrap_or("Unknown").to_string(),
 									body,
+									headers,
 								}))
 							};
 							this.response_future = Some(Box::pin(error_future));

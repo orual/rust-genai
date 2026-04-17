@@ -123,6 +123,13 @@ Cause:\n{cause}
 		status: StatusCode,
 		canonical_reason: String,
 		body: String,
+		/// Response headers captured at the point of failure. Boxed to
+		/// keep the `Error` enum size small (HeaderMap is ~48 bytes +
+		/// content). Consumers can read `Retry-After`, tier-specific
+		/// rate-limit reset headers, and request-id correlation info
+		/// without losing information that's only available at the
+		/// protocol layer.
+		headers: Box<reqwest::header::HeaderMap>,
 	},
 
 	// -- Modules

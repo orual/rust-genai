@@ -1248,6 +1248,80 @@ mod tests {
 			"ANTHROPIC_VERSION bump should be a deliberate decision"
 		);
 	}
+
+	/// Wire-shape verification: a ToolResponse with `content: Value::Array`
+	/// must serialize as a native JSON array on the Anthropic wire, NOT as
+	/// a stringified JSON string.
+	///
+	/// This guards the pattern where segment-3 text is folded INTO the
+	/// ToolResponse's content as a nested block array (matching claude-code's
+	/// `smooshIntoToolResult` pattern). If `json!({"content": value_array})`
+	/// ever emitted `"content": "[{...}]"` (stringified) instead of
+	/// `"content": [{...}]` (native), Anthropic would reject the payload.
+	///
+	/// Verified: serde_json's `json!` macro inlines a `Value::Array` as a
+	/// native JSON array — not a string — so `tool_result.content` is emitted
+	/// correctly.
+	#[test]
+	fn test_tool_response_array_content_emits_native_json_array_on_wire() {
+		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ToolResponse};
+
+		// Build a ToolResponse whose content is a Value::Array of text blocks —
+		// the shape produced by the segment-3 splice in pattern_runtime.
+		let folded_content = json!([
+			{"type": "text", "text": "seg3 memory context"},
+			{"type": "text", "text": "original tool output"},
+		]);
+		let tool_response = ToolResponse::new_content("toolu_spliced", folded_content);
+
+		// Build an assistant(tool_use) + tool(tool_result) message pair.
+		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![ContentPart::ToolCall(
+			crate::chat::ToolCall {
+				call_id: "toolu_spliced".into(),
+				fn_name: "code".into(),
+				fn_arguments: json!({"code": "pure ()"}),
+				thought_signatures: None,
+			},
+		)]));
+		let tool_msg = ChatMessage::tool(tool_response);
+
+		let req = ChatRequest::from_user("run this")
+			.append_message(assistant_msg)
+			.append_message(tool_msg);
+
+		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("wire serialization should succeed");
+
+		// The last message in the Anthropic wire format is the user message
+		// containing the tool_result block (Tool-role messages are emitted as
+		// user-role on the wire with tool_result content blocks).
+		let last_wire_msg = parts.messages.last().expect("must have at least one message");
+		let wire_content = last_wire_msg.get("content").expect("message must have content");
+		let content_arr = wire_content.as_array().expect("top-level content must be an array");
+
+		// Find the tool_result block.
+		let tool_result = content_arr
+			.iter()
+			.find(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+			.expect("must have a tool_result block");
+
+		// The nested content of the tool_result must be a native JSON array,
+		// NOT a string. A stringified array like "[{...}]" would be a bug.
+		let nested_content = tool_result.get("content").expect("tool_result must have a content field");
+
+		assert!(
+			nested_content.is_array(),
+			"tool_result.content must be a native JSON array, got: {nested_content:?}. \
+			If this fails, Value::Array content is being stringified — see the seg3 splice \
+			in pattern_runtime/src/agent_loop.rs"
+		);
+
+		let nested_arr = nested_content.as_array().unwrap();
+		assert_eq!(nested_arr.len(), 2, "must have exactly 2 blocks (seg3 + original)");
+		assert_eq!(nested_arr[0]["type"], "text");
+		assert_eq!(nested_arr[0]["text"], "seg3 memory context");
+		assert_eq!(nested_arr[1]["type"], "text");
+		assert_eq!(nested_arr[1]["text"], "original tool output");
+	}
 }
 
 // endregion: --- Tests

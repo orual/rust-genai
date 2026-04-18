@@ -1,6 +1,6 @@
 //! This is support implementation of the OpenAI Adapter which can also be called by other OpenAI Adapter Variants
 
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{content_as_string, get_api_key};
 use crate::adapter::openai::OpenAIAdapter;
 use crate::adapter::{AdapterDispatcher, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
@@ -380,7 +380,7 @@ impl OpenAIAdapter {
 						if let ContentPart::ToolResponse(tool_response) = part {
 							messages.push(json!({
 								"role": "tool",
-								"content": tool_response.content,
+								"content": content_as_string(&tool_response.content),
 								"tool_call_id": tool_response.call_id,
 							}))
 						}

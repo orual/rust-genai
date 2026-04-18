@@ -1,4 +1,4 @@
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{content_as_string, get_api_key};
 use crate::adapter::gemini::GeminiStreamer;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
@@ -605,7 +605,7 @@ impl GeminiAdapter {
 										"name": tool_response.call_id,
 										"response": {
 											"name": tool_response.call_id,
-											"content": tool_response.content,
+											"content": content_as_string(&tool_response.content),
 										}
 									}
 								}));
@@ -716,7 +716,9 @@ impl GeminiAdapter {
 										"name": tool_response.call_id,
 										"response": {
 											"name": tool_response.call_id,
-											"content": tool_response.content,
+											// Gemini requires a flat string; stringify structured
+											// content (e.g. Anthropic nested block arrays).
+											"content": content_as_string(&tool_response.content),
 										}
 									}
 								}));

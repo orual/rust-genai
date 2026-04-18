@@ -51,3 +51,21 @@ pub struct StreamerCapturedData {
 }
 
 // endregion: --- Streamer Captured Data
+
+// region:    --- Tool Content Helpers
+
+/// Return a tool response content value as a flat string.
+///
+/// Providers that require plain-string tool content (OpenAI, Gemini, Ollama)
+/// use this helper. A `Value::String` is returned verbatim; any other JSON
+/// shape is serialized to its compact JSON string representation. This is a
+/// lossless fallback — structured content (e.g. Anthropic nested block arrays)
+/// round-trips through JSON rather than being silently dropped.
+pub fn content_as_string(content: &serde_json::Value) -> String {
+	match content {
+		serde_json::Value::String(s) => s.clone(),
+		other => other.to_string(),
+	}
+}
+
+// endregion: --- Tool Content Helpers

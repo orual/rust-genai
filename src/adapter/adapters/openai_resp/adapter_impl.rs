@@ -1,4 +1,4 @@
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{content_as_string, get_api_key};
 use crate::adapter::openai::OpenAIAdapter;
 use crate::adapter::openai_resp::OpenAIRespStreamer;
 use crate::adapter::openai_resp::resp_types::RespResponse;
@@ -501,7 +501,7 @@ impl OpenAIRespAdapter {
 							input_items.push(json!({
 								"type": "function_call_output",
 								"call_id": tool_response.call_id,
-								"output": tool_response.content,
+								"output": content_as_string(&tool_response.content),
 							}))
 						}
 					}

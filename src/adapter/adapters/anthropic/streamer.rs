@@ -24,7 +24,11 @@ pub struct AnthropicStreamer {
 enum InProgressBlock {
 	Text,
 	ToolUse { id: String, name: String, input: String },
-	Thinking,
+	/// Accumulates the thinking text and signature for the current thinking block.
+	/// Anthropic delivers the signature as a single `delta/signature` event at the
+	/// end of each thinking block, but we store it on the block so it stays paired
+	/// with the block's reasoning text when we capture it at `content_block_stop`.
+	Thinking { reasoning: String, signature: Option<String> },
 }
 
 impl AnthropicStreamer {
@@ -78,7 +82,12 @@ impl futures::Stream for AnthropicStreamer {
 
 							match data.x_get_str("/content_block/type") {
 								Ok("text") => self.in_progress_block = InProgressBlock::Text,
-								Ok("thinking") => self.in_progress_block = InProgressBlock::Thinking,
+								Ok("thinking") => {
+									self.in_progress_block = InProgressBlock::Thinking {
+										reasoning: String::new(),
+										signature: None,
+									};
+								}
 								Ok("tool_use") => {
 									let id: String = data.x_take("/content_block/id")?;
 									let name: String = data.x_take("/content_block/name")?;
@@ -146,9 +155,14 @@ impl futures::Stream for AnthropicStreamer {
 
 									return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tc))));
 								}
-								InProgressBlock::Thinking => {
+								InProgressBlock::Thinking { reasoning, signature } => {
 									if let Ok(thinking) = data.x_take::<String>("/delta/thinking") {
-										// Add to the captured_thinking if chat options say so
+										// Accumulate reasoning text on the in-progress block so we
+										// have the full text available at content_block_stop for pairing
+										// with the signature before capturing.
+										reasoning.push_str(&thinking);
+
+										// Also add to captured_reasoning_content if the option is set.
 										if self.options.capture_reasoning_content {
 											match self.captured_data.reasoning_content {
 												Some(ref mut r) => r.push_str(&thinking),
@@ -157,10 +171,12 @@ impl futures::Stream for AnthropicStreamer {
 										}
 
 										return Poll::Ready(Some(Ok(InterStreamEvent::ReasoningChunk(thinking))));
-									} else if let Ok(signature) = data.x_take::<String>("/delta/signature") {
-										return Poll::Ready(Some(Ok(InterStreamEvent::ThoughtSignatureChunk(
-											signature,
-										))));
+									} else if let Ok(sig) = data.x_take::<String>("/delta/signature") {
+										// Record the signature on the block. Anthropic delivers this
+										// as a single event at the end of the thinking block's deltas.
+										*signature = Some(sig.clone());
+
+										return Poll::Ready(Some(Ok(InterStreamEvent::ThoughtSignatureChunk(sig))));
 									} else {
 										// If it is thinking but no thinking or signature field, we log and skip.
 										tracing::warn!(
@@ -197,8 +213,25 @@ impl futures::Stream for AnthropicStreamer {
 										}
 									}
 								}
-								_ => {
-									// no-op for remaining block types
+								InProgressBlock::Thinking { reasoning, signature } => {
+									// Capture the signature for this thinking block so the adapter
+									// can reconstruct signed thinking blocks on the next turn.
+									// We capture whenever we have a signature, regardless of other
+									// capture flags, because signature capture is necessary for
+									// continued thinking across tool-use cycles.
+									if let Some(sig) = signature {
+										match self.captured_data.thought_signatures {
+											Some(ref mut sigs) => sigs.push(sig),
+											None => self.captured_data.thought_signatures = Some(vec![sig]),
+										}
+									}
+									// The per-block reasoning text has already been accumulated
+									// into captured_data.reasoning_content during content_block_delta.
+									// We drop the per-block copy here; the combined string is kept.
+									let _ = reasoning;
+								}
+								InProgressBlock::Text => {
+									// no-op for text blocks
 								}
 							}
 
@@ -232,7 +265,10 @@ impl futures::Stream for AnthropicStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: None,
+								// Populate with the per-block signatures accumulated during the stream.
+								// These are used by the adapter to reconstruct signed thinking blocks
+								// on the follow-up request so the model can continue its reasoning chain.
+								captured_thought_signatures: self.captured_data.thought_signatures.take(),
 								captured_response_id: None,
 							};
 

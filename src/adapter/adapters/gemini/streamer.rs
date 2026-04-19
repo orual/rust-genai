@@ -1,6 +1,7 @@
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::gemini::{GeminiAdapter, GeminiChatResponse};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
+use crate::adapter::AdapterKind;
 use crate::chat::{ChatOptionsSet, StopReason, ToolCall};
 use crate::webc::WebStream;
 use crate::{Error, ModelIden, Result};
@@ -65,7 +66,7 @@ impl futures::Stream for GeminiStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: self.captured_data.thought_signatures.take(),
+								captured_thought_signatures: self.captured_data.take_thought_signatures(),
 								captured_response_id: None,
 							};
 
@@ -136,11 +137,8 @@ impl futures::Stream for GeminiStreamer {
 
 							// 1. Thought
 							if let Some(thought) = stream_thought {
-								// Capture thought
-								match self.captured_data.thought_signatures {
-									Some(ref mut thoughts) => thoughts.push(thought.clone()),
-									None => self.captured_data.thought_signatures = Some(vec![thought.clone()]),
-								}
+								// Capture thought with Gemini provenance.
+								self.captured_data.push_thought_signature(thought.clone(), AdapterKind::Gemini);
 
 								if self.options.capture_usage {
 									self.captured_data.usage = Some(usage.clone());

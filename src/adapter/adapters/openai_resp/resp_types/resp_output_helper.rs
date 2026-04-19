@@ -40,6 +40,7 @@ impl ContentPart {
 					fn_name,
 					fn_arguments,
 					thought_signatures: None,
+					thought_signatures_provenance: None,
 				};
 
 				parts.push(tool_call.into());

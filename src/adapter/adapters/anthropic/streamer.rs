@@ -1,6 +1,7 @@
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::anthropic::parse_cache_creation_details;
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
+use crate::adapter::AdapterKind;
 use crate::chat::{ChatOptionsSet, PromptTokensDetails, StopReason, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
@@ -99,6 +100,7 @@ impl futures::Stream for AnthropicStreamer {
 										fn_name: name.clone(),
 										fn_arguments: Value::String(String::new()),
 										thought_signatures: None,
+										thought_signatures_provenance: None,
 									};
 
 									self.in_progress_block = InProgressBlock::ToolUse {
@@ -151,6 +153,7 @@ impl futures::Stream for AnthropicStreamer {
 										fn_name: name.clone(),
 										fn_arguments: Value::String(input.clone()),
 										thought_signatures: None,
+										thought_signatures_provenance: None,
 									};
 
 									return Poll::Ready(Some(Ok(InterStreamEvent::ToolCallChunk(tc))));
@@ -205,6 +208,7 @@ impl futures::Stream for AnthropicStreamer {
 											fn_name: name,
 											fn_arguments,
 											thought_signatures: None,
+											thought_signatures_provenance: None,
 										};
 
 										match self.captured_data.tool_calls {
@@ -220,10 +224,7 @@ impl futures::Stream for AnthropicStreamer {
 									// capture flags, because signature capture is necessary for
 									// continued thinking across tool-use cycles.
 									if let Some(sig) = signature {
-										match self.captured_data.thought_signatures {
-											Some(ref mut sigs) => sigs.push(sig),
-											None => self.captured_data.thought_signatures = Some(vec![sig]),
-										}
+										self.captured_data.push_thought_signature(sig, AdapterKind::Anthropic);
 									}
 									// The per-block reasoning text has already been accumulated
 									// into captured_data.reasoning_content during content_block_delta.
@@ -268,7 +269,7 @@ impl futures::Stream for AnthropicStreamer {
 								// Populate with the per-block signatures accumulated during the stream.
 								// These are used by the adapter to reconstruct signed thinking blocks
 								// on the follow-up request so the model can continue its reasoning chain.
-								captured_thought_signatures: self.captured_data.thought_signatures.take(),
+								captured_thought_signatures: self.captured_data.take_thought_signatures(),
 								captured_response_id: None,
 							};
 

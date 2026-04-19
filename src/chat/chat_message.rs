@@ -1,4 +1,5 @@
-use crate::chat::{ContentPart, MessageContent, ToolCall, ToolResponse};
+use crate::adapter::AdapterKind;
+use crate::chat::{ContentPart, MessageContent, ThinkingBlock, ToolCall, ToolResponse};
 use derive_more::From;
 use serde::{Deserialize, Serialize};
 
@@ -89,21 +90,34 @@ impl ChatMessage {
 		self
 	}
 
-	/// Attach reasoning content to this message as a `ContentPart::ReasoningContent` part.
+	/// Attach reasoning content to this message as an unsigned `ContentPart::ThinkingBlock` part.
 	/// This is used for round-tripping assistant reasoning (e.g., DeepSeek, Kimi).
+	/// The provenance is set to `OpenAI` as a generic unsigned marker; callers that know the
+	/// actual adapter should construct a `ThinkingBlock` directly.
 	pub fn with_reasoning_content(mut self, reasoning: Option<String>) -> Self {
-		if let Some(reasoning) = reasoning {
-			self.content.push(ContentPart::ReasoningContent(reasoning));
+		if let Some(text) = reasoning {
+			self.content
+				.push(ContentPart::ThinkingBlock(ThinkingBlock::unsigned(AdapterKind::OpenAI, text)));
 		}
 		self
 	}
 
 	/// Convenience: build an assistant message that contains an optional list
 	/// of thought signatures followed by tool calls. Useful for providers
-	/// (e.g., Gemini 3) that require the thought signature to appear before
+	/// (e.g., Gemini, Anthropic) that require the thought signature to appear before
 	/// tool calls in the assistant turn when continuing a tool-use exchange.
-	pub fn assistant_tool_calls_with_thoughts(tool_calls: Vec<ToolCall>, thought_signatures: Vec<String>) -> Self {
-		let mut parts: Vec<ContentPart> = thought_signatures.into_iter().map(ContentPart::ThoughtSignature).collect();
+	///
+	/// The `provenance` parameter records which adapter produced these signatures so
+	/// the outbound serializers can decide whether to include them on the wire.
+	pub fn assistant_tool_calls_with_thoughts(
+		tool_calls: Vec<ToolCall>,
+		thought_signatures: Vec<String>,
+		provenance: AdapterKind,
+	) -> Self {
+		let mut parts: Vec<ContentPart> = thought_signatures
+			.into_iter()
+			.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(provenance, "", sig)))
+			.collect();
 		parts.extend(tool_calls.into_iter().map(ContentPart::ToolCall));
 		ChatMessage::assistant(MessageContent::from_parts(parts))
 	}
@@ -191,13 +205,22 @@ pub enum ChatRole {
 
 // region:    --- Froms
 
-/// Will create a Assisttant ChatMessage with this vect of tool
+/// Will create an Assistant ChatMessage from a vec of tool calls.
+/// If the first tool call carries thought signatures, they are prepended as
+/// `ThinkingBlock` parts (with provenance from `thought_signatures_provenance`).
 impl From<Vec<ToolCall>> for ChatMessage {
 	fn from(tool_calls: Vec<ToolCall>) -> Self {
 		if let Some(first) = tool_calls.first()
 			&& let Some(thoughts) = &first.thought_signatures
 		{
-			let mut parts: Vec<ContentPart> = thoughts.iter().cloned().map(ContentPart::ThoughtSignature).collect();
+			let provenance = first
+				.thought_signatures_provenance
+				.unwrap_or(AdapterKind::Anthropic);
+			let mut parts: Vec<ContentPart> = thoughts
+				.iter()
+				.cloned()
+				.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(provenance, "", sig)))
+				.collect();
 			parts.extend(tool_calls.into_iter().map(ContentPart::ToolCall));
 			return ChatMessage::assistant(MessageContent::from_parts(parts));
 		}

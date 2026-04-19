@@ -1,6 +1,7 @@
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::adapter::openai_resp::resp_types::RespResponse;
+use crate::adapter::AdapterKind;
 use crate::chat::{ChatOptionsSet, StopReason, ToolCall};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
@@ -133,6 +134,7 @@ impl futures::Stream for OpenAIRespStreamer {
 									fn_name,
 									fn_arguments: Value::String(String::new()),
 									thought_signatures: None,
+									thought_signatures_provenance: None,
 								};
 
 								self.in_progress_tool_calls.insert(output_index, tool_call);
@@ -212,8 +214,8 @@ impl futures::Stream for OpenAIRespStreamer {
 										thought_sigs.push(encrypted.to_string());
 									}
 								}
-								if !thought_sigs.is_empty() {
-									self.captured_data.thought_signatures = Some(thought_sigs);
+								for sig in thought_sigs {
+									self.captured_data.push_thought_signature(sig, AdapterKind::OpenAI);
 								}
 							}
 
@@ -223,7 +225,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: self.captured_data.thought_signatures.take(),
+								captured_thought_signatures: self.captured_data.take_thought_signatures(),
 								captured_response_id: Some(response.id),
 							};
 

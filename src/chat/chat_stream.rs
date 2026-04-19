@@ -1,5 +1,6 @@
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
-use crate::chat::{ChatMessage, ContentPart, MessageContent, StopReason, ToolCall, Usage};
+use crate::adapter::AdapterKind;
+use crate::chat::{ChatMessage, ContentPart, MessageContent, StopReason, ThinkingBlock, ToolCall, Usage};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -129,25 +130,21 @@ impl From<InterStreamEnd> for StreamEnd {
 		let mut captured_tool_calls = inter_end.captured_tool_calls;
 
 		// -- create public captured_content
-		// Ordering policy: ThoughtSignature -> Text -> ToolCall
-		// This matches provider expectations (e.g., Gemini 3 requires thought first).
+		// Ordering policy: ThinkingBlock -> Text -> ToolCall
+		// This matches provider expectations (e.g., Gemini, Anthropic require thinking first).
 		let mut captured_content: Option<MessageContent> = None;
-		if let Some(captured_thoughts) = inter_end.captured_thought_signatures {
-			let thoughts_content = captured_thoughts
-				.into_iter()
-				.map(ContentPart::ThoughtSignature)
+		if let Some((captured_sigs, provenance)) = inter_end.captured_thought_signatures {
+			let thoughts_content = captured_sigs
+				.iter()
+				.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(provenance, "", sig.clone())))
 				.collect::<Vec<_>>();
 			// Also attach thoughts to the first tool call so that
 			// ChatMessage::from(Vec<ToolCall>) can auto-prepend them.
 			if let Some(tool_calls) = captured_tool_calls.as_mut()
 				&& let Some(first_call) = tool_calls.first_mut()
 			{
-				first_call.thought_signatures = Some(
-					thoughts_content
-						.iter()
-						.filter_map(|p| p.as_thought_signature().map(|s| s.to_string()))
-						.collect(),
-				);
+				first_call.thought_signatures = Some(captured_sigs);
+				first_call.thought_signatures_provenance = Some(provenance);
 			}
 			if let Some(existing_content) = &mut captured_content {
 				existing_content.extend_front(thoughts_content);
@@ -253,10 +250,18 @@ impl StreamEnd {
 	pub fn into_assistant_message_for_tool_use(self) -> Option<ChatMessage> {
 		let content = self.captured_content?;
 		let mut thought_signatures: Vec<String> = Vec::new();
+		let mut provenance: AdapterKind = AdapterKind::Anthropic;
 		let mut tool_calls: Vec<ToolCall> = Vec::new();
 		for part in content.into_parts() {
 			match part {
-				ContentPart::ThoughtSignature(t) => thought_signatures.push(t),
+				ContentPart::ThinkingBlock(block) => {
+					// Collect signed blocks only; unsigned reasoning text goes via
+					// `captured_reasoning_content`.
+					if let Some(sig) = block.signature {
+						thought_signatures.push(sig);
+						provenance = block.provenance;
+					}
+				}
 				ContentPart::ToolCall(tc) => tool_calls.push(tc),
 				_ => {}
 			}
@@ -265,7 +270,7 @@ impl StreamEnd {
 			return None;
 		}
 		Some(
-			ChatMessage::assistant_tool_calls_with_thoughts(tool_calls, thought_signatures)
+			ChatMessage::assistant_tool_calls_with_thoughts(tool_calls, thought_signatures, provenance)
 				.with_reasoning_content(self.captured_reasoning_content),
 		)
 	}

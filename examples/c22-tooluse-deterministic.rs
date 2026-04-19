@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 			fn_name: "get_weather".to_string(),
 			fn_arguments: json!({"city": "Paris", "unit": "C"}),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		}]),
 		ChatMessage::from(ToolResponse::new(
 			"call_123".to_string(),

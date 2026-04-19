@@ -255,6 +255,7 @@ fn parse_tool_call(raw_tool_call: Value) -> Result<ToolCall> {
 		fn_name,
 		fn_arguments,
 		thought_signatures: None,
+		thought_signatures_provenance: None,
 	})
 }
 

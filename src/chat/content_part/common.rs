@@ -1,3 +1,4 @@
+use crate::adapter::AdapterKind;
 use crate::chat::{Binary, CustomPart, ToolCall, ToolResponse};
 use crate::{ModelIden, Result};
 use derive_more::From;
@@ -5,6 +6,55 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
+
+/// A unified thinking/reasoning content block.
+///
+/// Replaces the previous `ThoughtSignature(String)` and `ReasoningContent(String)` variants
+/// with a single struct that carries both the text and the opaque provider signature,
+/// tagged with which adapter produced it.
+///
+/// Outbound gating rule (per adapter serializer):
+/// - `signature.is_some() && provenance != target_adapter` → drop (cross-provider, not round-trippable)
+/// - `signature.is_none()` → pass through as plain reasoning text
+/// - `provenance == target_adapter` → native wire format (e.g. Anthropic `{"type":"thinking",...}`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThinkingBlock {
+	/// Which adapter produced this thinking block.
+	pub provenance: AdapterKind,
+	/// The reasoning/thinking text (may be absent for redacted blocks).
+	pub text: Option<String>,
+	/// The opaque provider signature enabling round-trip (may be absent for unsigned blocks).
+	pub signature: Option<String>,
+}
+
+impl ThinkingBlock {
+	/// Create a signed thinking block (has both text and signature).
+	pub fn signed(provenance: AdapterKind, text: impl Into<String>, signature: impl Into<String>) -> Self {
+		Self {
+			provenance,
+			text: Some(text.into()),
+			signature: Some(signature.into()),
+		}
+	}
+
+	/// Create an unsigned thinking block (text only, no signature).
+	pub fn unsigned(provenance: AdapterKind, text: impl Into<String>) -> Self {
+		Self {
+			provenance,
+			text: Some(text.into()),
+			signature: None,
+		}
+	}
+
+	/// Create a redacted thinking block (signature only, no text).
+	pub fn redacted(provenance: AdapterKind, signature: impl Into<String>) -> Self {
+		Self {
+			provenance,
+			text: None,
+			signature: Some(signature.into()),
+		}
+	}
+}
 
 /// A single content segment in a chat message.
 ///
@@ -23,15 +73,13 @@ pub enum ContentPart {
 	#[from]
 	ToolResponse(ToolResponse),
 
+	/// A thinking/reasoning block from any provider that supports it.
+	///
+	/// Carries provenance (which adapter produced it), optional text, and optional
+	/// opaque signature for round-tripping. Replaces the previous split
+	/// `ThoughtSignature(String)` + `ReasoningContent(String)` variants.
 	#[from(ignore)]
-	ThoughtSignature(String),
-
-	/// Reasoning/thinking content from models that support it (e.g., DeepSeek, kimi).
-	/// Adapters extract provider-specific reasoning and normalize it into this variant.
-	/// On the request path, adapters hoist these parts back into the provider wire format
-	/// (e.g., sibling `reasoning_content` field for OpenAI-compatible providers).
-	#[from(ignore)]
-	ReasoningContent(String),
+	ThinkingBlock(ThinkingBlock),
 
 	#[from]
 	Custom(CustomPart),
@@ -159,37 +207,55 @@ impl ContentPart {
 		}
 	}
 
-	/// Borrow the thought signature if present.
+	/// Borrow the thought signature if present (returns the block's `signature` field).
 	pub fn as_thought_signature(&self) -> Option<&str> {
-		if let ContentPart::ThoughtSignature(thought_signature) = self {
-			Some(thought_signature)
+		if let ContentPart::ThinkingBlock(block) = self {
+			block.signature.as_deref()
 		} else {
 			None
 		}
 	}
 
-	/// Extract the thought, consuming the part.
+	/// Extract the thought signature string, consuming the part.
 	pub fn into_thought_signature(self) -> Option<String> {
-		if let ContentPart::ThoughtSignature(thought_signature) = self {
-			Some(thought_signature)
+		if let ContentPart::ThinkingBlock(block) = self {
+			block.signature
 		} else {
 			None
 		}
 	}
 
-	/// Borrow the reasoning content if present.
+	/// Borrow the reasoning/thinking text if present (returns the block's `text` field).
 	pub fn as_reasoning_content(&self) -> Option<&str> {
-		if let ContentPart::ReasoningContent(reasoning) = self {
-			Some(reasoning)
+		if let ContentPart::ThinkingBlock(block) = self {
+			block.text.as_deref()
 		} else {
 			None
 		}
 	}
 
-	/// Extract the reasoning content, consuming the part.
+	/// Extract the reasoning text, consuming the part.
 	pub fn into_reasoning_content(self) -> Option<String> {
-		if let ContentPart::ReasoningContent(reasoning) = self {
-			Some(reasoning)
+		if let ContentPart::ThinkingBlock(block) = self {
+			block.text
+		} else {
+			None
+		}
+	}
+
+	/// Borrow the full ThinkingBlock if present.
+	pub fn as_thinking_block(&self) -> Option<&ThinkingBlock> {
+		if let ContentPart::ThinkingBlock(block) = self {
+			Some(block)
+		} else {
+			None
+		}
+	}
+
+	/// Extract the ThinkingBlock, consuming the part.
+	pub fn into_thinking_block(self) -> Option<ThinkingBlock> {
+		if let ContentPart::ThinkingBlock(block) = self {
+			Some(block)
 		} else {
 			None
 		}
@@ -228,8 +294,10 @@ impl ContentPart {
 			ContentPart::Binary(binary) => binary.size(),
 			ContentPart::ToolCall(tool_call) => tool_call.size(),
 			ContentPart::ToolResponse(tool_response) => tool_response.size(),
-			ContentPart::ThoughtSignature(thought) => thought.len(),
-			ContentPart::ReasoningContent(reasoning) => reasoning.len(),
+			ContentPart::ThinkingBlock(block) => {
+				block.text.as_deref().map(|t| t.len()).unwrap_or(0)
+					+ block.signature.as_deref().map(|s| s.len()).unwrap_or(0)
+			}
 			ContentPart::Custom(_value) => 0, // TODO: will need to compute this size
 		}
 	}
@@ -283,14 +351,19 @@ impl ContentPart {
 		matches!(self, ContentPart::ToolResponse(_))
 	}
 
-	/// Returns true if this part is a thought.
+	/// Returns true if this part is a ThinkingBlock with a signature.
 	pub fn is_thought_signature(&self) -> bool {
-		matches!(self, ContentPart::ThoughtSignature(_))
+		matches!(self, ContentPart::ThinkingBlock(b) if b.signature.is_some())
 	}
 
-	/// Returns true if this part is reasoning content.
+	/// Returns true if this part is a ThinkingBlock with reasoning text.
 	pub fn is_reasoning_content(&self) -> bool {
-		matches!(self, ContentPart::ReasoningContent(_))
+		matches!(self, ContentPart::ThinkingBlock(b) if b.text.is_some())
+	}
+
+	/// Returns true if this part is a ThinkingBlock (any variant).
+	pub fn is_thinking_block(&self) -> bool {
+		matches!(self, ContentPart::ThinkingBlock(_))
 	}
 
 	/// Returns true if this part is custom provider-specific content.

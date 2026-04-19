@@ -99,7 +99,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 					for part in parts {
 						match part {
 							genai::chat::ContentPart::ToolCall(tc) => extracted_tool_calls.push(tc),
-							genai::chat::ContentPart::ThoughtSignature(t) => extracted_thoughts.push(t),
+							genai::chat::ContentPart::ThinkingBlock(b) => {
+								if let Some(sig) = b.signature {
+									extracted_thoughts.push(sig);
+								}
+							}
 							_ => {}
 						}
 					}
@@ -148,7 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		// We can convert to Vec, insert, and convert back.
 		let mut parts = assistant_msg.content.into_parts();
 		for thought in thoughts.into_iter().rev() {
-			parts.insert(0, genai::chat::ContentPart::ThoughtSignature(thought));
+			parts.insert(0, genai::chat::ContentPart::ThinkingBlock(genai::chat::ThinkingBlock::signed(
+				genai::adapter::AdapterKind::Gemini, "", thought,
+			)));
 		}
 		assistant_msg.content = genai::chat::MessageContent::from_parts(parts);
 	}

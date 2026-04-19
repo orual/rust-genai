@@ -431,8 +431,7 @@ impl OpenAIRespAdapter {
 								// TODO: Probably need to warn if it is a ToolCalls type of content
 								ContentPart::ToolCall(_) => (),
 								ContentPart::ToolResponse(_) => (),
-								ContentPart::ThoughtSignature(_) => (),
-								ContentPart::ReasoningContent(_) => (),
+								ContentPart::ThinkingBlock(_) => (),
 								// Custom are ignored for this logic
 								ContentPart::Custom(_) => {}
 							}
@@ -474,11 +473,10 @@ impl OpenAIRespAdapter {
 								}))
 							}
 
-							// TODO: Probably need towarn on this one (probably need to add binary here)
+							// TODO: Probably need to warn on this one (probably need to add binary here)
 							ContentPart::Binary(_) => {}
 							ContentPart::ToolResponse(_) => {}
-							ContentPart::ThoughtSignature(_) => {}
-							ContentPart::ReasoningContent(_) => {}
+							ContentPart::ThinkingBlock(_) => {}
 							// Custom are ignored for this logic
 							ContentPart::Custom(_) => {}
 						}

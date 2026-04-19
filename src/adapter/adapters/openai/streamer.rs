@@ -75,6 +75,7 @@ impl OpenAIStreamer {
 			fn_name: fn_name.clone(),
 			fn_arguments: Value::String(arguments.clone()),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		};
 
 		if !self.options.capture_tool_calls {
@@ -159,6 +160,7 @@ impl futures::Stream for OpenAIStreamer {
 										fn_name,
 										fn_arguments,
 										thought_signatures: None,
+										thought_signatures_provenance: None,
 									}
 								})
 								.collect();

@@ -4,7 +4,7 @@ use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, ChatOptionsSet, ChatRequest, ChatResponse, ChatResponseFormat, ChatRole, ChatStream,
 	ChatStreamResponse, CompletionTokensDetails, ContentPart, MessageContent, PromptTokensDetails, ReasoningEffort,
-	StopReason, Tool, ToolCall, ToolConfig, ToolName, Usage,
+	StopReason, ThinkingBlock, Tool, ToolCall, ToolConfig, ToolName, Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{WebResponse, WebStream};
@@ -169,12 +169,16 @@ impl Adapter for GeminiAdapter {
 		}
 
 		let thought_signatures_for_call = (!thoughts.is_empty() && !tool_calls.is_empty()).then(|| thoughts.clone());
-		let mut parts: Vec<ContentPart> = thoughts.into_iter().map(ContentPart::ThoughtSignature).collect();
+		let mut parts: Vec<ContentPart> = thoughts
+			.into_iter()
+			.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Gemini, "", sig)))
+			.collect();
 
 		if let Some(signatures) = thought_signatures_for_call
 			&& let Some(first_call) = tool_calls.first_mut()
 		{
 			first_call.thought_signatures = Some(signatures);
+			first_call.thought_signatures_provenance = Some(AdapterKind::Gemini);
 		}
 
 		if !texts.is_empty() {
@@ -309,6 +313,9 @@ impl GeminiAdapter {
 
 			// -- Thought signature (Gemini 3+) or legacy thought boolean
 			if let Some(sig) = take_string(&mut part, "thoughtSignature") {
+				// Gemini 3+ provides a per-part opaque signature. Store it in the
+				// GeminiChatContent enum so it can later be converted to a ThinkingBlock
+				// with Gemini provenance.
 				content.push(GeminiChatContent::ThoughtSignature(sig));
 			} else if take_bool(&mut part, "thought") {
 				// Legacy: `thought: true` + `text` = reasoning content
@@ -329,6 +336,7 @@ impl GeminiAdapter {
 					fn_name,
 					fn_arguments: fc.x_get("args").unwrap_or(Value::Null),
 					thought_signatures: None,
+					thought_signatures_provenance: None,
 				}));
 			}
 
@@ -610,13 +618,7 @@ impl GeminiAdapter {
 									}
 								}));
 							}
-							ContentPart::ThoughtSignature(thought) => {
-								parts_values.push(json!({
-									"thoughtSignature": thought
-								}));
-							}
-
-							ContentPart::ReasoningContent(_) => {}
+							ContentPart::ThinkingBlock(_) => {}
 							// Custom are ignored for this logic
 							ContentPart::Custom(_) => {}
 						}
@@ -658,18 +660,26 @@ impl GeminiAdapter {
 								parts_values.push(Value::Object(part_obj));
 								is_first_tool_call = false;
 							}
-							// ThoughtSignature parts that arrive in the history are dropped
-							// on outbound serialization: they may be opaque blobs originated
-							// by a different provider (e.g. Anthropic) that Gemini cannot
-							// validate. Gemini-native signatures are not replayable across
-							// provider switches and are also dropped here for safety.
-							ContentPart::ThoughtSignature(_) => {}
+							ContentPart::ThinkingBlock(block) => {
+								// Only pass Gemini-native signed blocks back to Gemini.
+								// Blocks from other providers (Anthropic, OpenAI) carry
+								// opaque signatures that Gemini cannot validate; they are
+								// silently dropped to avoid wire errors. Unsigned blocks
+								// (reasoning text only) have no Gemini wire representation.
+								if block.provenance == AdapterKind::Gemini
+									&& let Some(sig) = block.signature
+								{
+									// Gemini native round-trip: emit the thoughtSignature on
+									// the first tool call part if one follows. If there is no
+									// tool call yet, emit as a standalone part (rare case).
+									// For simplicity we emit standalone here; the sentinel
+									// injection below handles the tool-call pairing.
+									parts_values.push(json!({ "thoughtSignature": sig }));
+								}
+							}
 							// Ignore unsupported parts for Assistant role.
 							ContentPart::Binary(_) => {}
 							ContentPart::ToolResponse(_) => {}
-							// ReasoningContent is Anthropic/DeepSeek-originated text; Gemini
-							// has no equivalent wire field so it is dropped silently.
-							ContentPart::ReasoningContent(_) => {}
 							// Custom are ignored for this logic.
 							ContentPart::Custom(_) => {}
 						}
@@ -703,12 +713,15 @@ impl GeminiAdapter {
 									}
 								}));
 							}
-							ContentPart::ThoughtSignature(thought) => {
-								parts_values.push(json!({
-									"thoughtSignature": thought
-								}));
+							ContentPart::ThinkingBlock(block) => {
+								// Gemini-native signed signatures can be forwarded on the Tool role.
+								// Signatures from other providers are dropped.
+								if block.provenance == AdapterKind::Gemini
+									&& let Some(sig) = block.signature
+								{
+									parts_values.push(json!({ "thoughtSignature": sig }));
+								}
 							}
-							ContentPart::ReasoningContent(_) => {}
 							_ => {
 								return Err(Error::MessageContentTypeNotSupported {
 									model_iden: model_iden.clone(),
@@ -1035,27 +1048,30 @@ mod tests {
 	}
 
 	/// Cross-provider safety: an assistant message that arrived from a previous
-	/// Anthropic turn may carry ThoughtSignature and ReasoningContent parts.
-	/// Both must be silently dropped on Gemini outbound serialization so that
+	/// Anthropic turn may carry ThinkingBlock parts with Anthropic provenance.
+	/// These must be silently dropped on Gemini outbound serialization so that
 	/// opaque Anthropic-format blobs are never forwarded to the Gemini wire API.
 	/// Text and ToolCall parts must be preserved unchanged.
 	#[test]
 	fn assistant_drops_thought_signature_and_reasoning_content_on_outbound() {
-		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ToolCall};
+		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ThinkingBlock, ToolCall};
 
 		let tool_call = ToolCall {
 			call_id: "call_1".to_string(),
 			fn_name: "search".to_string(),
 			fn_arguments: json!({"query": "rust"}),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		};
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
-			// Anthropic-originated opaque signature — must be dropped.
-			ContentPart::ThoughtSignature("ANTHROPIC_OPAQUE_BYTES".to_string()),
+			// Anthropic-originated opaque signature — must be dropped (wrong provenance).
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(
+				AdapterKind::Anthropic,
+				"I think I should search.",
+				"ANTHROPIC_OPAQUE_BYTES",
+			)),
 			ContentPart::Text("I will search for that.".to_string()),
-			// Anthropic-originated reasoning text — must be dropped.
-			ContentPart::ReasoningContent("I think I should search.".to_string()),
 			ContentPart::ToolCall(tool_call),
 		]));
 

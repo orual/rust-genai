@@ -320,8 +320,7 @@ impl OpenAIAdapter {
 								// TODO: Probably need to warn if it is a ToolCalls type of content
 								ContentPart::ToolCall(_) => (),
 								ContentPart::ToolResponse(_) => (),
-								ContentPart::ThoughtSignature(_) => (),
-								ContentPart::ReasoningContent(_) => (),
+								ContentPart::ThinkingBlock(_) => (),
 								// Custom are ignored for this logic
 								ContentPart::Custom(_) => {}
 							}
@@ -349,13 +348,24 @@ impl OpenAIAdapter {
 									}
 								}))
 							}
-							// Extract reasoning content parts to hoist into sibling field
-							ContentPart::ReasoningContent(reasoning) => reasoning_parts.push(reasoning),
+							// ThinkingBlock: extract unsigned/cross-provider reasoning text as
+							// `reasoning_content` sibling field (DeepSeek, Kimi). Signed blocks from
+							// other providers are dropped because their signatures are not valid for
+							// OpenAI-compatible endpoints.
+							ContentPart::ThinkingBlock(block) => {
+								// Unsigned blocks only: pass through reasoning text as `reasoning_content`
+								// for DeepSeek/Kimi compatibility. Signed cross-provider blocks are
+								// dropped because their signatures are not valid for OpenAI-compatible endpoints.
+								if let Some(text) = block.text
+									&& block.signature.is_none()
+								{
+									reasoning_parts.push(text);
+								}
+							}
 
-							// TODO: Probably need towarn on this one (probably need to add binary here)
+							// TODO: Probably need to warn on this one (probably need to add binary here)
 							ContentPart::Binary(_) => (),
 							ContentPart::ToolResponse(_) => (),
-							ContentPart::ThoughtSignature(_) => {}
 							// Custom are ignored for this logic
 							ContentPart::Custom(_) => {}
 						}
@@ -505,6 +515,7 @@ mod tests {
 			fn_name: "get_weather".to_string(),
 			fn_arguments: serde_json::json!({"city": "Paris"}),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		};
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
@@ -542,26 +553,31 @@ mod tests {
 	}
 
 	/// Cross-provider safety: an assistant message that arrived from a previous
-	/// Anthropic turn may carry ContentPart::ThoughtSignature parts. These are
-	/// Anthropic-specific opaque blobs that have no equivalent in the OpenAI
+	/// Anthropic turn may carry ContentPart::ThinkingBlock parts with Anthropic provenance.
+	/// These are Anthropic-specific opaque blobs that have no equivalent in the OpenAI
 	/// wire format. They must be silently dropped so that the request does not
 	/// contain invalid payloads.
 	///
-	/// ContentPart::Text and ContentPart::ToolCall must be preserved. The
-	/// existing ContentPart::ReasoningContent pass-through is intentional for
-	/// DeepSeek/Kimi compatibility and is also verified here.
+	/// ContentPart::Text and ContentPart::ToolCall must be preserved.
 	#[test]
 	fn test_cross_provider_thought_signature_dropped_on_openai_outbound() {
+		use crate::chat::ThinkingBlock;
+
 		let tool_call = ToolCall {
 			call_id: "call_42".to_string(),
 			fn_name: "lookup".to_string(),
 			fn_arguments: serde_json::json!({"key": "value"}),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		};
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
-			// Anthropic-originated opaque signature — must be dropped silently.
-			ContentPart::ThoughtSignature("ANTHROPIC_OPAQUE_BLOB".to_string()),
+			// Anthropic-originated signed block — must be dropped silently (wrong provenance for OpenAI).
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(
+				AdapterKind::Anthropic,
+				"I'll look that up.",
+				"ANTHROPIC_OPAQUE_BLOB",
+			)),
 			ContentPart::Text("I'll look that up.".to_string()),
 			ContentPart::ToolCall(tool_call),
 		]));
@@ -569,7 +585,7 @@ mod tests {
 		let chat_req = ChatRequest::new(vec![ChatMessage::user("Look up a value"), assistant_msg]);
 
 		let parts = OpenAIAdapter::into_openai_request_parts(&test_model(), chat_req)
-			.expect("serialization must not fail on cross-provider ThoughtSignature parts");
+			.expect("serialization must not fail on cross-provider ThinkingBlock parts");
 
 		// The assistant message is messages[1] (after user).
 		let assistant_json = &parts.messages[1];

@@ -4,7 +4,7 @@ use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, CacheControl, CacheCreationDetails, ChatOptionsSet, ChatRequest, ChatResponse,
 	ChatResponseFormat, ChatRole, ChatStream, ChatStreamResponse, ContentPart, MessageContent, PromptTokensDetails,
-	ReasoningEffort, StopReason, SystemBlock, Tool, ToolCall, ToolConfig, ToolName, Usage,
+	ReasoningEffort, StopReason, SystemBlock, ThinkingBlock, Tool, ToolCall, ToolConfig, ToolName, Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{EventSourceStream, WebResponse};
@@ -408,13 +408,12 @@ impl Adapter for AnthropicAdapter {
 
 					reasoning_content.push(thinking_text.clone());
 
-					// Emit the signature first (ordering matches the streaming path and
-					// the outbound serialization order in into_anthropic_request_parts).
-					if let Some(sig) = signature {
-						content.push(ContentPart::ThoughtSignature(sig));
-					}
-					// Emit the reasoning text so callers iterating content parts see it.
-					content.push(ContentPart::ReasoningContent(thinking_text));
+					// Emit a unified ThinkingBlock with provenance=Anthropic.
+					let block = match signature {
+						Some(sig) => ThinkingBlock::signed(AdapterKind::Anthropic, thinking_text, sig),
+						None => ThinkingBlock::unsigned(AdapterKind::Anthropic, thinking_text),
+					};
+					content.push(ContentPart::ThinkingBlock(block));
 				}
 				"tool_use" => {
 					let call_id = item.x_take::<String>("id")?;
@@ -426,6 +425,7 @@ impl Adapter for AnthropicAdapter {
 						fn_name,
 						fn_arguments,
 						thought_signatures: None,
+						thought_signatures_provenance: None,
 					};
 
 					let part = ContentPart::ToolCall(tool_call);
@@ -695,8 +695,7 @@ impl AnthropicAdapter {
 										"tool_use_id": tool_response.call_id,
 									}));
 								}
-								ContentPart::ThoughtSignature(_) => {}
-								ContentPart::ReasoningContent(_) => {}
+								ContentPart::ThinkingBlock(_) => {}
 								// Custom are ignored for this logic
 								ContentPart::Custom(_) => {}
 							}
@@ -752,11 +751,18 @@ impl AnthropicAdapter {
 									"input": input,
 								}));
 							}
-							ContentPart::ThoughtSignature(sig) => {
-								thought_signatures.push(sig);
-							}
-							ContentPart::ReasoningContent(text) => {
-								reasoning_texts.push(text);
+							ContentPart::ThinkingBlock(block) => {
+								// Only include thinking blocks that originated from Anthropic.
+								// Blocks from other providers carry signatures that Anthropic
+								// cannot verify, so they must be dropped to avoid wire errors.
+								if block.provenance == AdapterKind::Anthropic {
+									if let Some(sig) = block.signature {
+										thought_signatures.push(sig);
+									}
+									if let Some(text) = block.text {
+										reasoning_texts.push(text);
+									}
+								}
 							}
 							// Unsupported for assistant role in Anthropic message content
 							ContentPart::Binary(_) => {}
@@ -1343,6 +1349,7 @@ mod tests {
 				fn_name: "code".into(),
 				fn_arguments: json!({"code": "pure ()"}),
 				thought_signatures: None,
+				thought_signatures_provenance: None,
 			},
 		)]));
 		let tool_msg = ChatMessage::tool(tool_response);
@@ -1399,20 +1406,19 @@ mod tests {
 	fn test_thinking_blocks_preserved_across_tool_use_turns() {
 		// Turn N assistant response: the model produced a thinking block, then called a tool.
 		// This is the shape produced by `StreamEnd::into_assistant_message_for_tool_use`:
-		//   [ThoughtSignature("sig-abc"), ToolCall(...), ReasoningContent("step 1 think")]
+		//   [ThinkingBlock(signed, Anthropic), ToolCall(...), ThinkingBlock(unsigned, OpenAI)]
 		let thinking_text = "step 1: I need to look up the weather.";
 		let signature = "sig-ABCDEFG1234567";
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
-			ContentPart::ThoughtSignature(signature.to_string()),
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, thinking_text, signature)),
 			ContentPart::ToolCall(ToolCall {
 				call_id: "toolu_01XYZ".to_string(),
 				fn_name: "get_weather".to_string(),
 				fn_arguments: json!({"city": "Paris"}),
 				thought_signatures: None,
+				thought_signatures_provenance: None,
 			}),
-			// ReasoningContent is appended by with_reasoning_content in into_assistant_message_for_tool_use.
-			ContentPart::ReasoningContent(thinking_text.to_string()),
 		]));
 
 		// Turn N tool result (user-role on the Anthropic wire).
@@ -1493,15 +1499,15 @@ mod tests {
 		let combined_reasoning = "block one text block two text";
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
-			ContentPart::ThoughtSignature(sig1.to_string()),
-			ContentPart::ThoughtSignature(sig2.to_string()),
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, combined_reasoning, sig1)),
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, "", sig2)),
 			ContentPart::ToolCall(ToolCall {
 				call_id: "toolu_multi".to_string(),
 				fn_name: "search".to_string(),
 				fn_arguments: json!({"q": "test"}),
 				thought_signatures: None,
+				thought_signatures_provenance: None,
 			}),
-			ContentPart::ReasoningContent(combined_reasoning.to_string()),
 		]));
 
 		let req = ChatRequest::new(vec![
@@ -1612,41 +1618,41 @@ mod tests {
 			"reasoning_content must carry the thinking text (backward-compat field)"
 		);
 
-		// The content parts must contain both ThoughtSignature and ReasoningContent.
+		// The content parts must contain a ThinkingBlock with both signature and text.
 		let parts: Vec<&ContentPart> = chat_response.content.iter().collect();
 
-		// Find ThoughtSignature part.
-		let sig_part = parts.iter().find(|p| p.is_thought_signature());
+		// Find the ThinkingBlock part.
+		let thinking_part = parts.iter().find(|p| p.is_thinking_block());
 		assert!(
-			sig_part.is_some(),
-			"content must contain a ThoughtSignature part for non-streaming responses; \
+			thinking_part.is_some(),
+			"content must contain a ThinkingBlock part for non-streaming responses; \
 			without it, signed thinking blocks cannot be round-tripped across tool-use turns"
 		);
+		let block = thinking_part.unwrap().as_thinking_block().unwrap();
 		assert_eq!(
-			sig_part.unwrap().as_thought_signature(),
+			block.signature.as_deref(),
 			Some(signature),
-			"ThoughtSignature must carry the verbatim signature from the wire"
-		);
-
-		// Find ReasoningContent part.
-		let rc_part = parts.iter().find(|p| p.is_reasoning_content());
-		assert!(
-			rc_part.is_some(),
-			"content must contain a ReasoningContent part for non-streaming responses"
+			"ThinkingBlock must carry the verbatim signature from the wire"
 		);
 		assert_eq!(
-			rc_part.unwrap().as_reasoning_content(),
+			block.text.as_deref(),
 			Some(thinking_text),
-			"ReasoningContent must carry the verbatim thinking text from the wire"
+			"ThinkingBlock must carry the verbatim thinking text from the wire"
+		);
+		assert_eq!(
+			block.provenance,
+			AdapterKind::Anthropic,
+			"ThinkingBlock provenance must be Anthropic"
 		);
 
-		// Ordering: ThoughtSignature must precede ReasoningContent.
-		let sig_idx = parts.iter().position(|p| p.is_thought_signature()).unwrap();
-		let rc_idx = parts.iter().position(|p| p.is_reasoning_content()).unwrap();
+		// is_thought_signature and is_reasoning_content must both be true for a signed block with text.
 		assert!(
-			sig_idx < rc_idx,
-			"ThoughtSignature (idx={sig_idx}) must appear before ReasoningContent (idx={rc_idx}) \
-			to match the streaming path and outbound serialization order"
+			thinking_part.unwrap().is_thought_signature(),
+			"a signed ThinkingBlock must report is_thought_signature() == true"
+		);
+		assert!(
+			thinking_part.unwrap().is_reasoning_content(),
+			"a ThinkingBlock with text must report is_reasoning_content() == true"
 		);
 
 		// The regular text part must also be present.
@@ -1697,15 +1703,21 @@ mod tests {
 		// reasoning_content field still populated.
 		assert_eq!(chat_response.reasoning_content.as_deref(), Some(thinking_text));
 
-		// ReasoningContent part emitted.
-		let has_rc = chat_response.content.iter().any(|p| p.is_reasoning_content());
-		assert!(has_rc, "ReasoningContent part must be emitted even without a signature");
+		// ThinkingBlock part emitted with text.
+		let thinking_part = chat_response.content.iter().find(|p| p.is_thinking_block());
+		assert!(thinking_part.is_some(), "ThinkingBlock part must be emitted even without a signature");
+		let block = thinking_part.unwrap().as_thinking_block().unwrap();
+		assert_eq!(block.text.as_deref(), Some(thinking_text));
+		assert!(block.signature.is_none(), "unsigned block must have no signature");
 
-		// No spurious ThoughtSignature part.
-		let has_sig = chat_response.content.iter().any(|p| p.is_thought_signature());
+		// is_reasoning_content true, is_thought_signature false (no signature field).
 		assert!(
-			!has_sig,
-			"ThoughtSignature must NOT be emitted when the wire response has no signature field"
+			thinking_part.unwrap().is_reasoning_content(),
+			"unsigned ThinkingBlock must report is_reasoning_content() == true"
+		);
+		assert!(
+			!thinking_part.unwrap().is_thought_signature(),
+			"ThoughtSignature check must be false when block has no signature"
 		);
 	}
 }

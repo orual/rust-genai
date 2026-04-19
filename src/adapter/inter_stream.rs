@@ -5,6 +5,7 @@
 //!
 //! NOTE: This might be removed at some point as it may not be needed, and we could go directly to the GenAI stream.
 
+use crate::adapter::AdapterKind;
 use crate::chat::{StopReason, Usage};
 
 #[derive(Debug, Default)]
@@ -24,8 +25,9 @@ pub struct InterStreamEnd {
 	// When `ChatOptions..capture_tool_calls == true`
 	pub captured_tool_calls: Option<Vec<crate::chat::ToolCall>>,
 
-	// When `ChatOptions..capture_thought_signatures == true` (implied or explicit)
-	pub captured_thought_signatures: Option<Vec<String>>,
+	// When `ChatOptions..capture_thought_signatures == true` (implied or explicit).
+	// Tuple of (signatures, provenance_adapter) for correct outbound gating.
+	pub captured_thought_signatures: Option<(Vec<String>, AdapterKind)>,
 
 	// Response ID for stateful sessions (OpenAI Responses API).
 	pub captured_response_id: Option<String>,

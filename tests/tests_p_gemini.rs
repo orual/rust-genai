@@ -152,6 +152,7 @@ async fn test_tool_deterministic_history_gemini_3_ok() -> TestResult<()> {
 			fn_name: "get_weather".to_string(),
 			fn_arguments: json!({"city": "Paris", "unit": "C"}),
 			thought_signatures: None,
+			thought_signatures_provenance: None,
 		}]),
 		ChatMessage::from(ToolResponse::new(
 			"call_123".to_string(),

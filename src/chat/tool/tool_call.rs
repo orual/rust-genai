@@ -1,3 +1,4 @@
+use crate::adapter::AdapterKind;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -18,12 +19,21 @@ pub struct ToolCall {
 	/// Optional thought signatures that should precede tool calls in the assistant turn.
 	///
 	/// When present on the first tool call in a batch, `ChatMessage::from(Vec<ToolCall>)`
-	/// will automatically include these as leading `ThoughtSignature` parts in the
+	/// will automatically include these as leading `ThinkingBlock` parts in the
 	/// assistant message content. This enables simple continuations like:
 	/// `append_message(tool_calls).append_message(tool_response)` without having to
 	/// manually inject thoughts.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub thought_signatures: Option<Vec<String>>,
+
+	/// Which adapter produced the `thought_signatures` above.
+	///
+	/// Required for correct outbound gating: a signature from Anthropic must only be
+	/// sent back to an Anthropic endpoint, a Gemini signature only to Gemini, etc.
+	/// When `None`, the provenance is unknown and signatures should be treated as
+	/// cross-provider (i.e. dropped on outbound serialization).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub thought_signatures_provenance: Option<AdapterKind>,
 }
 
 /// Computed accessors

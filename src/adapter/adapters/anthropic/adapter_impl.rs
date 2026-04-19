@@ -398,7 +398,24 @@ impl Adapter for AnthropicAdapter {
 					let part = ContentPart::from_text(item.x_take::<String>("text")?);
 					content.push(part);
 				}
-				"thinking" => reasoning_content.push(item.x_take("thinking")?),
+				"thinking" => {
+					let thinking_text: String = item.x_take("thinking")?;
+					// Capture the opaque signature so this thinking block can be
+					// round-tripped on the next turn. Anthropic requires the original
+					// `{"type":"thinking","thinking":"...","signature":"..."}` shape
+					// when the thinking block is sent back in a subsequent request.
+					let signature: Option<String> = item.x_take("signature").ok();
+
+					reasoning_content.push(thinking_text.clone());
+
+					// Emit the signature first (ordering matches the streaming path and
+					// the outbound serialization order in into_anthropic_request_parts).
+					if let Some(sig) = signature {
+						content.push(ContentPart::ThoughtSignature(sig));
+					}
+					// Emit the reasoning text so callers iterating content parts see it.
+					content.push(ContentPart::ReasoningContent(thinking_text));
+				}
 				"tool_use" => {
 					let call_id = item.x_take::<String>("id")?;
 					let fn_name = item.x_take::<String>("name")?;
@@ -1532,6 +1549,163 @@ mod tests {
 		assert_eq!(
 			thinking_blocks[1].get("signature").and_then(|v| v.as_str()),
 			Some(sig2),
+		);
+	}
+
+	/// Regression guard: the non-streaming (`to_chat_response`) path must capture both
+	/// the signature and the reasoning text from an Anthropic `thinking` content block.
+	///
+	/// Without this fix, `to_chat_response` dropped the `signature` field, preventing
+	/// signed thinking blocks from being round-tripped across tool-use turns when the
+	/// caller is using the non-streaming API.
+	///
+	/// The test constructs a synthetic Anthropic response body containing a thinking
+	/// block with a known signature and verifies that both `ContentPart::ThoughtSignature`
+	/// and `ContentPart::ReasoningContent` appear in the returned `ChatResponse.content`,
+	/// in that order (signature before reasoning text, matching the streaming path).
+	#[test]
+	fn test_to_chat_response_captures_thinking_signature_and_content() {
+		use crate::webc::WebResponse;
+		use reqwest::StatusCode;
+
+		let thinking_text = "I need to think carefully about this.";
+		let signature = "sig-TEST-INBOUND-0042";
+
+		// Synthetic Anthropic non-streaming response body.
+		let body = json!({
+			"id": "msg_01test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-opus-4-6-20250514",
+			"stop_reason": "end_turn",
+			"usage": {
+				"input_tokens": 10,
+				"output_tokens": 25
+			},
+			"content": [
+				{
+					"type": "thinking",
+					"thinking": thinking_text,
+					"signature": signature
+				},
+				{
+					"type": "text",
+					"text": "The answer is 42."
+				}
+			]
+		});
+
+		let web_response = WebResponse {
+			status: StatusCode::OK,
+			body,
+		};
+		let model_iden = ModelIden::new(AdapterKind::Anthropic, "claude-opus-4-6-20250514");
+		let options_set = ChatOptionsSet::default();
+
+		let chat_response =
+			AnthropicAdapter::to_chat_response(model_iden, web_response, options_set).expect("to_chat_response must succeed");
+
+		// The legacy `reasoning_content` string field must still be populated.
+		assert_eq!(
+			chat_response.reasoning_content.as_deref(),
+			Some(thinking_text),
+			"reasoning_content must carry the thinking text (backward-compat field)"
+		);
+
+		// The content parts must contain both ThoughtSignature and ReasoningContent.
+		let parts: Vec<&ContentPart> = chat_response.content.iter().collect();
+
+		// Find ThoughtSignature part.
+		let sig_part = parts.iter().find(|p| p.is_thought_signature());
+		assert!(
+			sig_part.is_some(),
+			"content must contain a ThoughtSignature part for non-streaming responses; \
+			without it, signed thinking blocks cannot be round-tripped across tool-use turns"
+		);
+		assert_eq!(
+			sig_part.unwrap().as_thought_signature(),
+			Some(signature),
+			"ThoughtSignature must carry the verbatim signature from the wire"
+		);
+
+		// Find ReasoningContent part.
+		let rc_part = parts.iter().find(|p| p.is_reasoning_content());
+		assert!(
+			rc_part.is_some(),
+			"content must contain a ReasoningContent part for non-streaming responses"
+		);
+		assert_eq!(
+			rc_part.unwrap().as_reasoning_content(),
+			Some(thinking_text),
+			"ReasoningContent must carry the verbatim thinking text from the wire"
+		);
+
+		// Ordering: ThoughtSignature must precede ReasoningContent.
+		let sig_idx = parts.iter().position(|p| p.is_thought_signature()).unwrap();
+		let rc_idx = parts.iter().position(|p| p.is_reasoning_content()).unwrap();
+		assert!(
+			sig_idx < rc_idx,
+			"ThoughtSignature (idx={sig_idx}) must appear before ReasoningContent (idx={rc_idx}) \
+			to match the streaming path and outbound serialization order"
+		);
+
+		// The regular text part must also be present.
+		let text_part = parts.iter().find(|p| p.is_text());
+		assert!(text_part.is_some(), "content must still contain the text part");
+		assert_eq!(
+			text_part.unwrap().as_text(),
+			Some("The answer is 42."),
+		);
+	}
+
+	/// Verify that a `to_chat_response` thinking block WITHOUT a signature (e.g. from
+	/// a provider that omits it) still produces a `ReasoningContent` part without
+	/// panicking and without emitting a spurious `ThoughtSignature` part.
+	#[test]
+	fn test_to_chat_response_thinking_without_signature_does_not_emit_signature_part() {
+		use crate::webc::WebResponse;
+		use reqwest::StatusCode;
+
+		let thinking_text = "Just reasoning, no signature here.";
+
+		let body = json!({
+			"id": "msg_02test",
+			"type": "message",
+			"role": "assistant",
+			"model": "claude-opus-4-6-20250514",
+			"stop_reason": "end_turn",
+			"usage": {"input_tokens": 5, "output_tokens": 10},
+			"content": [
+				{
+					"type": "thinking",
+					"thinking": thinking_text
+					// no "signature" field
+				}
+			]
+		});
+
+		let web_response = WebResponse {
+			status: StatusCode::OK,
+			body,
+		};
+		let model_iden = ModelIden::new(AdapterKind::Anthropic, "claude-opus-4-6-20250514");
+		let options_set = ChatOptionsSet::default();
+
+		let chat_response =
+			AnthropicAdapter::to_chat_response(model_iden, web_response, options_set).expect("must succeed without signature");
+
+		// reasoning_content field still populated.
+		assert_eq!(chat_response.reasoning_content.as_deref(), Some(thinking_text));
+
+		// ReasoningContent part emitted.
+		let has_rc = chat_response.content.iter().any(|p| p.is_reasoning_content());
+		assert!(has_rc, "ReasoningContent part must be emitted even without a signature");
+
+		// No spurious ThoughtSignature part.
+		let has_sig = chat_response.content.iter().any(|p| p.is_thought_signature());
+		assert!(
+			!has_sig,
+			"ThoughtSignature must NOT be emitted when the wire response has no signature field"
 		);
 	}
 }

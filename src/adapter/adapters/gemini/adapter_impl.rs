@@ -626,15 +626,11 @@ impl GeminiAdapter {
 				}
 				ChatRole::Assistant => {
 					let mut parts_values: Vec<Value> = Vec::new();
-					let mut pending_thought: Option<String> = None;
 					let mut is_first_tool_call = true;
 
 					for part in msg.content {
 						match part {
 							ContentPart::Text(text) => {
-								if let Some(thought) = pending_thought.take() {
-									parts_values.push(json!({"thoughtSignature": thought}));
-								}
 								parts_values.push(json!({"text": text}));
 							}
 							ContentPart::ToolCall(tool_call) => {
@@ -647,52 +643,36 @@ impl GeminiAdapter {
 									}),
 								);
 
-								match pending_thought.take() {
-									Some(thought) => {
-										// Inject thoughtSignature alongside functionCall in the same Part object
-										part_obj.insert("thoughtSignature".to_string(), json!(thought));
-									}
-									None => {
-										// For Gemini 3 models, if there haven't been any thoughts, and this is
-										// still the first tool call, we are required to inject a special flag.
-										// See: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
-										let is_gemini_3 = model_iden.model_name.contains("gemini-3");
-										if is_gemini_3 && is_first_tool_call {
-											part_obj.insert(
-												"thoughtSignature".to_string(),
-												json!("skip_thought_signature_validator"),
-											);
-										}
-									}
+								// For Gemini 3 models, the first tool call with no preceding
+								// thought signature requires a sentinel flag so the API
+								// validator does not reject the request.
+								// See: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
+								let is_gemini_3 = model_iden.model_name.contains("gemini-3");
+								if is_gemini_3 && is_first_tool_call {
+									part_obj.insert(
+										"thoughtSignature".to_string(),
+										json!("skip_thought_signature_validator"),
+									);
 								}
 
 								parts_values.push(Value::Object(part_obj));
 								is_first_tool_call = false;
 							}
-							ContentPart::ThoughtSignature(thought) => {
-								if let Some(prev_thought) = pending_thought.take() {
-									parts_values.push(json!({"thoughtSignature": prev_thought}));
-								}
-								pending_thought = Some(thought);
-							}
-							// Ignore unsupported parts for Assistant role
-							ContentPart::Binary(_) => {
-								if let Some(thought) = pending_thought.take() {
-									parts_values.push(json!({"thoughtSignature": thought}));
-								}
-							}
-							ContentPart::ToolResponse(_) => {
-								if let Some(thought) = pending_thought.take() {
-									parts_values.push(json!({"thoughtSignature": thought}));
-								}
-							}
+							// ThoughtSignature parts that arrive in the history are dropped
+							// on outbound serialization: they may be opaque blobs originated
+							// by a different provider (e.g. Anthropic) that Gemini cannot
+							// validate. Gemini-native signatures are not replayable across
+							// provider switches and are also dropped here for safety.
+							ContentPart::ThoughtSignature(_) => {}
+							// Ignore unsupported parts for Assistant role.
+							ContentPart::Binary(_) => {}
+							ContentPart::ToolResponse(_) => {}
+							// ReasoningContent is Anthropic/DeepSeek-originated text; Gemini
+							// has no equivalent wire field so it is dropped silently.
 							ContentPart::ReasoningContent(_) => {}
-							// Custom are ignored for this logic
+							// Custom are ignored for this logic.
 							ContentPart::Custom(_) => {}
 						}
-					}
-					if let Some(thought) = pending_thought {
-						parts_values.push(json!({"thoughtSignature": thought}));
 					}
 					if !parts_values.is_empty() {
 						contents.push(json!({"role": "model", "parts": parts_values}));
@@ -1052,5 +1032,80 @@ mod tests {
 			Ok(_) => panic!("missing candidates should still be rejected"),
 		};
 		assert!(matches!(err, Error::ChatResponse { .. }));
+	}
+
+	/// Cross-provider safety: an assistant message that arrived from a previous
+	/// Anthropic turn may carry ThoughtSignature and ReasoningContent parts.
+	/// Both must be silently dropped on Gemini outbound serialization so that
+	/// opaque Anthropic-format blobs are never forwarded to the Gemini wire API.
+	/// Text and ToolCall parts must be preserved unchanged.
+	#[test]
+	fn assistant_drops_thought_signature_and_reasoning_content_on_outbound() {
+		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ToolCall};
+
+		let tool_call = ToolCall {
+			call_id: "call_1".to_string(),
+			fn_name: "search".to_string(),
+			fn_arguments: json!({"query": "rust"}),
+			thought_signatures: None,
+		};
+
+		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
+			// Anthropic-originated opaque signature — must be dropped.
+			ContentPart::ThoughtSignature("ANTHROPIC_OPAQUE_BYTES".to_string()),
+			ContentPart::Text("I will search for that.".to_string()),
+			// Anthropic-originated reasoning text — must be dropped.
+			ContentPart::ReasoningContent("I think I should search.".to_string()),
+			ContentPart::ToolCall(tool_call),
+		]));
+
+		let chat_req = ChatRequest::new(vec![ChatMessage::user("Search for rust"), assistant_msg]);
+
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-2.5-flash");
+		let parts = GeminiAdapter::into_gemini_request_parts(&model_iden, chat_req)
+			.expect("serialization should not fail on cross-provider reasoning parts");
+
+		// Find the model (assistant) entry.
+		let model_entry = parts
+			.contents
+			.iter()
+			.find(|c| c.get("role").and_then(|r| r.as_str()) == Some("model"))
+			.expect("model entry must be present");
+
+		let wire_parts = model_entry.get("parts").and_then(|p| p.as_array()).expect("parts must be array");
+
+		// ThoughtSignature and ReasoningContent must not appear as top-level keys.
+		for wire_part in wire_parts {
+			assert!(
+				wire_part.get("thoughtSignature").is_none()
+					|| wire_part
+						.get("functionCall")
+						.is_some(),
+				"thoughtSignature must only appear as a Gemini-3 sentinel on functionCall parts, not as a standalone part from Anthropic-originated signatures"
+			);
+			assert!(
+				wire_part.get("reasoningContent").is_none(),
+				"reasoningContent must not appear in the Gemini wire payload"
+			);
+		}
+
+		// The text part must be present.
+		let has_text = wire_parts.iter().any(|p| p.get("text").and_then(|t| t.as_str()) == Some("I will search for that."));
+		assert!(has_text, "text part must be preserved");
+
+		// The tool call must be present.
+		let has_tool_call = wire_parts.iter().any(|p| {
+			p.get("functionCall")
+				.and_then(|fc| fc.get("name"))
+				.and_then(|n| n.as_str())
+				== Some("search")
+		});
+		assert!(has_tool_call, "tool call part must be preserved");
+
+		// No standalone thoughtSignature-only part (i.e. no part with only thoughtSignature and no functionCall).
+		let has_standalone_thought_sig = wire_parts.iter().any(|p| {
+			p.get("thoughtSignature").is_some() && p.get("functionCall").is_none()
+		});
+		assert!(!has_standalone_thought_sig, "no standalone thoughtSignature parts should be emitted from Anthropic-originated parts");
 	}
 }

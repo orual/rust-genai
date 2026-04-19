@@ -540,6 +540,63 @@ mod tests {
 			"reasoning_content should be absent when not set"
 		);
 	}
+
+	/// Cross-provider safety: an assistant message that arrived from a previous
+	/// Anthropic turn may carry ContentPart::ThoughtSignature parts. These are
+	/// Anthropic-specific opaque blobs that have no equivalent in the OpenAI
+	/// wire format. They must be silently dropped so that the request does not
+	/// contain invalid payloads.
+	///
+	/// ContentPart::Text and ContentPart::ToolCall must be preserved. The
+	/// existing ContentPart::ReasoningContent pass-through is intentional for
+	/// DeepSeek/Kimi compatibility and is also verified here.
+	#[test]
+	fn test_cross_provider_thought_signature_dropped_on_openai_outbound() {
+		let tool_call = ToolCall {
+			call_id: "call_42".to_string(),
+			fn_name: "lookup".to_string(),
+			fn_arguments: serde_json::json!({"key": "value"}),
+			thought_signatures: None,
+		};
+
+		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
+			// Anthropic-originated opaque signature — must be dropped silently.
+			ContentPart::ThoughtSignature("ANTHROPIC_OPAQUE_BLOB".to_string()),
+			ContentPart::Text("I'll look that up.".to_string()),
+			ContentPart::ToolCall(tool_call),
+		]));
+
+		let chat_req = ChatRequest::new(vec![ChatMessage::user("Look up a value"), assistant_msg]);
+
+		let parts = OpenAIAdapter::into_openai_request_parts(&test_model(), chat_req)
+			.expect("serialization must not fail on cross-provider ThoughtSignature parts");
+
+		// The assistant message is messages[1] (after user).
+		let assistant_json = &parts.messages[1];
+		assert_eq!(assistant_json["role"], "assistant");
+
+		// ThoughtSignature must not appear anywhere in the wire payload.
+		let wire_str = assistant_json.to_string();
+		assert!(
+			!wire_str.contains("ANTHROPIC_OPAQUE_BLOB"),
+			"Anthropic thought signature must not leak into OpenAI wire payload: {wire_str}"
+		);
+		assert!(
+			!wire_str.contains("thought_signature") && !wire_str.contains("thoughtSignature"),
+			"no thought signature field must appear in the OpenAI wire payload: {wire_str}"
+		);
+
+		// Text must be preserved.
+		assert_eq!(
+			assistant_json["content"], "I'll look that up.",
+			"text content must be preserved"
+		);
+
+		// ToolCall must be present.
+		let tool_calls = assistant_json.get("tool_calls").and_then(|v| v.as_array()).expect("tool_calls must be present");
+		assert_eq!(tool_calls.len(), 1);
+		assert_eq!(tool_calls[0]["function"]["name"], "lookup");
+	}
 }
 
 // endregion: --- Tests

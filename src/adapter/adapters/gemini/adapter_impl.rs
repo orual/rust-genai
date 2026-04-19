@@ -152,34 +152,93 @@ impl Adapter for GeminiAdapter {
 		} = gemini_response;
 		let stop_reason = stop_reason.map(StopReason::from);
 
-		let mut thoughts: Vec<String> = Vec::new();
 		let mut reasonings: Vec<String> = Vec::new();
 		let mut texts: Vec<String> = Vec::new();
 		let mut tool_calls: Vec<ToolCall> = Vec::new();
 		let mut binary_parts: Vec<Binary> = Vec::new();
+		// All signatures seen in wire order, used to build ThinkingBlock content parts.
+		let mut all_signatures: Vec<String> = Vec::new();
 
+		// Walk content in wire order to pair each thoughtSignature with the
+		// functionCall that immediately follows it.
+		//
+		// Wire format: body_to_gemini_chat_response processes each response part and,
+		// when a part contains both a thoughtSignature and a functionCall, it pushes
+		// GeminiChatContent::ThoughtSignature immediately before GeminiChatContent::ToolCall.
+		// This means the signature always precedes its associated tool call in gemini_content.
+		//
+		// Edge cases:
+		// - Consecutive signatures (no intervening tool call): the orphaned first signature
+		//   is attached to the most recent tool call (if any) with a warning, then dropped.
+		// - Trailing signature (no following tool call): attached to the last tool call
+		//   (if any) with a warning, then dropped.
+		// - More tool calls than signatures: later tool calls get no signature.
+		let mut pending_signature: Option<String> = None;
 		for g_item in gemini_content {
 			match g_item {
 				GeminiChatContent::Text(text) => texts.push(text),
 				GeminiChatContent::Binary(binary) => binary_parts.push(binary),
-				GeminiChatContent::ToolCall(tool_call) => tool_calls.push(tool_call),
-				GeminiChatContent::ThoughtSignature(thought) => thoughts.push(thought),
 				GeminiChatContent::Reasoning(reasoning_text) => reasonings.push(reasoning_text),
+				GeminiChatContent::ThoughtSignature(sig) => {
+					// Record this signature for the ThinkingBlock content parts regardless.
+					all_signatures.push(sig.clone());
+					if let Some(prev) = pending_signature.replace(sig) {
+						// Two signatures in a row with no intervening tool call.
+						// This is unexpected per the Gemini 3 spec. Attach the orphaned
+						// first signature to the last tool call seen (if any).
+						if let Some(last_call) = tool_calls.last_mut() {
+							tracing::warn!(
+								"gemini inbound: unexpected consecutive thoughtSignatures; \
+								 attaching orphaned signature to last tool call '{}'",
+								last_call.fn_name
+							);
+							last_call
+								.thought_signatures
+								.get_or_insert_with(Vec::new)
+								.push(prev);
+						} else {
+							tracing::warn!(
+								"gemini inbound: orphaned thoughtSignature (no tool call to attach to); dropping"
+							);
+						}
+					}
+				}
+				GeminiChatContent::ToolCall(mut tool_call) => {
+					if let Some(sig) = pending_signature.take() {
+						// Pair this signature with its associated tool call.
+						tool_call.thought_signatures = Some(vec![sig]);
+						tool_call.thought_signatures_provenance = Some(AdapterKind::Gemini);
+					}
+					tool_calls.push(tool_call);
+				}
 			}
 		}
 
-		let thought_signatures_for_call = (!thoughts.is_empty() && !tool_calls.is_empty()).then(|| thoughts.clone());
-		let mut parts: Vec<ContentPart> = thoughts
+		// Any signature still pending had no following tool call. Attach to last call
+		// if possible, otherwise drop.
+		if let Some(leftover) = pending_signature {
+			if let Some(last_call) = tool_calls.last_mut() {
+				tracing::warn!(
+					"gemini inbound: trailing thoughtSignature with no following tool call; \
+					 attaching to last tool call '{}'",
+					last_call.fn_name
+				);
+				last_call
+					.thought_signatures
+					.get_or_insert_with(Vec::new)
+					.push(leftover);
+			} else {
+				tracing::warn!("gemini inbound: trailing thoughtSignature with no tool calls; dropping");
+			}
+		}
+
+		// Build ThinkingBlock content parts from all collected signatures (in order).
+		// These sit alongside the ToolCall parts in the final message content so that
+		// callers have the full thinking context as well as the per-call assignment.
+		let mut parts: Vec<ContentPart> = all_signatures
 			.into_iter()
 			.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Gemini, "", sig)))
 			.collect();
-
-		if let Some(signatures) = thought_signatures_for_call
-			&& let Some(first_call) = tool_calls.first_mut()
-		{
-			first_call.thought_signatures = Some(signatures);
-			first_call.thought_signatures_provenance = Some(AdapterKind::Gemini);
-		}
 
 		if !texts.is_empty() {
 			let total_len: usize = texts.iter().map(|t| t.len()).sum();
@@ -1123,5 +1182,181 @@ mod tests {
 			p.get("thoughtSignature").is_some() && p.get("functionCall").is_none()
 		});
 		assert!(!has_standalone_thought_sig, "no standalone thoughtSignature parts should be emitted from Anthropic-originated parts");
+	}
+
+	/// A 2-function-call response where each part carries its own thoughtSignature.
+	/// This is the primary Gemini 3 multi-tool-call case. Each ToolCall must receive
+	/// its own distinct signature — not a shared list and not the wrong signature.
+	#[test]
+	fn inbound_two_function_calls_each_get_own_signature() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+		let body = json!({
+			"candidates": [{
+				"content": {
+					"role": "model",
+					"parts": [
+						{
+							// Part 1: reasoning + first tool call.
+							"thoughtSignature": "sig_for_read",
+							"functionCall": {"name": "read_file", "args": {"path": "a.rs"}}
+						},
+						{
+							// Part 2: reasoning + second tool call.
+							"thoughtSignature": "sig_for_write",
+							"functionCall": {"name": "write_file", "args": {"path": "b.rs", "content": "hi"}}
+						}
+					]
+				}
+			}],
+			"usageMetadata": {"totalTokenCount": 200}
+		});
+
+		let chat_response = GeminiAdapter::to_chat_response(
+			model_iden,
+			crate::webc::WebResponse {
+				status: reqwest::StatusCode::OK,
+				body,
+			},
+			ChatOptionsSet::default(),
+		)
+		.unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 2, "expected exactly 2 tool calls");
+
+		let read_call = tool_calls.iter().find(|tc| tc.fn_name == "read_file").expect("read_file not found");
+		let write_call = tool_calls.iter().find(|tc| tc.fn_name == "write_file").expect("write_file not found");
+
+		// Each call must have exactly one signature — its own, not the other's.
+		let read_sigs = read_call.thought_signatures.as_deref().unwrap_or(&[]);
+		let write_sigs = write_call.thought_signatures.as_deref().unwrap_or(&[]);
+		assert_eq!(read_sigs, &["sig_for_read"], "read_file must carry only sig_for_read");
+		assert_eq!(write_sigs, &["sig_for_write"], "write_file must carry only sig_for_write");
+
+		// Provenance must be set to Gemini on both.
+		assert_eq!(read_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
+		assert_eq!(write_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// Both signatures must also appear as ThinkingBlock content parts.
+		let thinking_sigs: Vec<&str> = chat_response
+			.content
+			.iter()
+			.filter_map(|p| p.as_thought_signature())
+			.collect();
+		assert!(thinking_sigs.contains(&"sig_for_read"), "sig_for_read must appear as ThinkingBlock");
+		assert!(thinking_sigs.contains(&"sig_for_write"), "sig_for_write must appear as ThinkingBlock");
+	}
+
+	/// Edge case: one signature, two tool calls. Only the first tool call should
+	/// get the signature; the second gets none.
+	#[test]
+	fn inbound_one_signature_two_tool_calls_assigns_to_first() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+
+		// We test at the body_to_gemini_chat_response + to_chat_response level.
+		// Wire: part1 has sig+call, part2 has only call (no sig).
+		let web_response = crate::webc::WebResponse {
+			status: reqwest::StatusCode::OK,
+			body: json!({
+				"candidates": [{
+					"content": {
+						"role": "model",
+						"parts": [
+							{
+								"thoughtSignature": "only_sig",
+								"functionCall": {"name": "tool_a", "args": {}}
+							},
+							{
+								// No thoughtSignature on this part.
+								"functionCall": {"name": "tool_b", "args": {}}
+							}
+						]
+					}
+				}],
+				"usageMetadata": {"totalTokenCount": 50}
+			}),
+		};
+
+		let chat_response = GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 2);
+
+		let tool_a = tool_calls.iter().find(|tc| tc.fn_name == "tool_a").expect("tool_a not found");
+		let tool_b = tool_calls.iter().find(|tc| tc.fn_name == "tool_b").expect("tool_b not found");
+
+		// tool_a gets the signature.
+		assert_eq!(
+			tool_a.thought_signatures.as_deref(),
+			Some(&[String::from("only_sig")][..])
+		);
+		assert_eq!(tool_a.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// tool_b gets no signature.
+		assert!(tool_b.thought_signatures.is_none(), "tool_b must have no signature");
+		assert!(tool_b.thought_signatures_provenance.is_none());
+	}
+
+	/// Edge case: two signatures, one tool call. The second (consecutive) signature
+	/// is the orphan — it has no preceding tool call at the time it arrives so it
+	/// must be attached to the last tool call with a warning, leaving the first call
+	/// with both signatures on it.
+	#[test]
+	fn inbound_two_signatures_one_tool_call_attaches_extra_to_last() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+
+		// Wire: part1 has sig1 only (no functionCall), part2 has sig2 + functionCall.
+		// This means: sig1 arrives → pending=sig1; sig2 arrives → orphan sig1 is
+		// attached to last tool call (none yet, so dropped with warning), pending=sig2;
+		// ToolCall arrives → paired with sig2.
+		//
+		// If instead the wire is: part1 has sig1+call1, part2 has sig2 (no call):
+		// sig1 arrives → pending=sig1; call1 arrives → paired with sig1; sig2 arrives
+		// → pending=sig2; (end) → leftover sig2 attached to call1 (last tool call).
+		//
+		// We test the latter shape since it is more realistic (a trailing orphan).
+		let web_response = crate::webc::WebResponse {
+			status: reqwest::StatusCode::OK,
+			body: json!({
+				"candidates": [{
+					"content": {
+						"role": "model",
+						"parts": [
+							{
+								"thoughtSignature": "sig_first",
+								"functionCall": {"name": "only_tool", "args": {}}
+							},
+							{
+								// Trailing signature with no associated functionCall.
+								"thoughtSignature": "sig_orphan"
+							}
+						]
+					}
+				}],
+				"usageMetadata": {"totalTokenCount": 30}
+			}),
+		};
+
+		let chat_response = GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 1, "expected exactly 1 tool call");
+
+		let only_tool = &tool_calls[0];
+		// The primary signature must be present.
+		let sigs = only_tool.thought_signatures.as_deref().unwrap_or(&[]);
+		assert!(sigs.contains(&"sig_first".to_string()), "sig_first must be attached");
+		// The orphan trailing signature must also be attached to the only call.
+		assert!(sigs.contains(&"sig_orphan".to_string()), "orphan sig_orphan must be attached to last tool call");
+		assert_eq!(only_tool.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// Both signatures must appear as ThinkingBlock parts.
+		let thinking_sigs: Vec<&str> = chat_response
+			.content
+			.iter()
+			.filter_map(|p| p.as_thought_signature())
+			.collect();
+		assert!(thinking_sigs.contains(&"sig_first"));
+		assert!(thinking_sigs.contains(&"sig_orphan"));
 	}
 }

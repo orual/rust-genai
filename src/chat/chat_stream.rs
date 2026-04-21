@@ -1,5 +1,5 @@
-use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::adapter::AdapterKind;
+use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::chat::{ChatMessage, ContentPart, MessageContent, StopReason, ThinkingBlock, ToolCall, Usage};
 use futures::Stream;
 use serde::{Deserialize, Serialize};

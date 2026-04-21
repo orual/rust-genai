@@ -192,10 +192,7 @@ impl Adapter for GeminiAdapter {
 								 attaching orphaned signature to last tool call '{}'",
 								last_call.fn_name
 							);
-							last_call
-								.thought_signatures
-								.get_or_insert_with(Vec::new)
-								.push(prev);
+							last_call.thought_signatures.get_or_insert_with(Vec::new).push(prev);
 						} else {
 							tracing::warn!(
 								"gemini inbound: orphaned thoughtSignature (no tool call to attach to); dropping"
@@ -223,10 +220,7 @@ impl Adapter for GeminiAdapter {
 					 attaching to last tool call '{}'",
 					last_call.fn_name
 				);
-				last_call
-					.thought_signatures
-					.get_or_insert_with(Vec::new)
-					.push(leftover);
+				last_call.thought_signatures.get_or_insert_with(Vec::new).push(leftover);
 			} else {
 				tracing::warn!("gemini inbound: trailing thoughtSignature with no tool calls; dropping");
 			}
@@ -1147,15 +1141,15 @@ mod tests {
 			.find(|c| c.get("role").and_then(|r| r.as_str()) == Some("model"))
 			.expect("model entry must be present");
 
-		let wire_parts = model_entry.get("parts").and_then(|p| p.as_array()).expect("parts must be array");
+		let wire_parts = model_entry
+			.get("parts")
+			.and_then(|p| p.as_array())
+			.expect("parts must be array");
 
 		// ThoughtSignature and ReasoningContent must not appear as top-level keys.
 		for wire_part in wire_parts {
 			assert!(
-				wire_part.get("thoughtSignature").is_none()
-					|| wire_part
-						.get("functionCall")
-						.is_some(),
+				wire_part.get("thoughtSignature").is_none() || wire_part.get("functionCall").is_some(),
 				"thoughtSignature must only appear as a Gemini-3 sentinel on functionCall parts, not as a standalone part from Anthropic-originated signatures"
 			);
 			assert!(
@@ -1165,23 +1159,25 @@ mod tests {
 		}
 
 		// The text part must be present.
-		let has_text = wire_parts.iter().any(|p| p.get("text").and_then(|t| t.as_str()) == Some("I will search for that."));
+		let has_text = wire_parts
+			.iter()
+			.any(|p| p.get("text").and_then(|t| t.as_str()) == Some("I will search for that."));
 		assert!(has_text, "text part must be preserved");
 
 		// The tool call must be present.
-		let has_tool_call = wire_parts.iter().any(|p| {
-			p.get("functionCall")
-				.and_then(|fc| fc.get("name"))
-				.and_then(|n| n.as_str())
-				== Some("search")
-		});
+		let has_tool_call = wire_parts
+			.iter()
+			.any(|p| p.get("functionCall").and_then(|fc| fc.get("name")).and_then(|n| n.as_str()) == Some("search"));
 		assert!(has_tool_call, "tool call part must be preserved");
 
 		// No standalone thoughtSignature-only part (i.e. no part with only thoughtSignature and no functionCall).
-		let has_standalone_thought_sig = wire_parts.iter().any(|p| {
-			p.get("thoughtSignature").is_some() && p.get("functionCall").is_none()
-		});
-		assert!(!has_standalone_thought_sig, "no standalone thoughtSignature parts should be emitted from Anthropic-originated parts");
+		let has_standalone_thought_sig = wire_parts
+			.iter()
+			.any(|p| p.get("thoughtSignature").is_some() && p.get("functionCall").is_none());
+		assert!(
+			!has_standalone_thought_sig,
+			"no standalone thoughtSignature parts should be emitted from Anthropic-originated parts"
+		);
 	}
 
 	/// A 2-function-call response where each part carries its own thoughtSignature.
@@ -1224,27 +1220,39 @@ mod tests {
 		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
 		assert_eq!(tool_calls.len(), 2, "expected exactly 2 tool calls");
 
-		let read_call = tool_calls.iter().find(|tc| tc.fn_name == "read_file").expect("read_file not found");
-		let write_call = tool_calls.iter().find(|tc| tc.fn_name == "write_file").expect("write_file not found");
+		let read_call = tool_calls
+			.iter()
+			.find(|tc| tc.fn_name == "read_file")
+			.expect("read_file not found");
+		let write_call = tool_calls
+			.iter()
+			.find(|tc| tc.fn_name == "write_file")
+			.expect("write_file not found");
 
 		// Each call must have exactly one signature — its own, not the other's.
 		let read_sigs = read_call.thought_signatures.as_deref().unwrap_or(&[]);
 		let write_sigs = write_call.thought_signatures.as_deref().unwrap_or(&[]);
 		assert_eq!(read_sigs, &["sig_for_read"], "read_file must carry only sig_for_read");
-		assert_eq!(write_sigs, &["sig_for_write"], "write_file must carry only sig_for_write");
+		assert_eq!(
+			write_sigs,
+			&["sig_for_write"],
+			"write_file must carry only sig_for_write"
+		);
 
 		// Provenance must be set to Gemini on both.
 		assert_eq!(read_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
 		assert_eq!(write_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
 
 		// Both signatures must also appear as ThinkingBlock content parts.
-		let thinking_sigs: Vec<&str> = chat_response
-			.content
-			.iter()
-			.filter_map(|p| p.as_thought_signature())
-			.collect();
-		assert!(thinking_sigs.contains(&"sig_for_read"), "sig_for_read must appear as ThinkingBlock");
-		assert!(thinking_sigs.contains(&"sig_for_write"), "sig_for_write must appear as ThinkingBlock");
+		let thinking_sigs: Vec<&str> = chat_response.content.iter().filter_map(|p| p.as_thought_signature()).collect();
+		assert!(
+			thinking_sigs.contains(&"sig_for_read"),
+			"sig_for_read must appear as ThinkingBlock"
+		);
+		assert!(
+			thinking_sigs.contains(&"sig_for_write"),
+			"sig_for_write must appear as ThinkingBlock"
+		);
 	}
 
 	/// Edge case: one signature, two tool calls. Only the first tool call should
@@ -1277,7 +1285,8 @@ mod tests {
 			}),
 		};
 
-		let chat_response = GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+		let chat_response =
+			GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
 
 		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
 		assert_eq!(tool_calls.len(), 2);
@@ -1337,7 +1346,8 @@ mod tests {
 			}),
 		};
 
-		let chat_response = GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+		let chat_response =
+			GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
 
 		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
 		assert_eq!(tool_calls.len(), 1, "expected exactly 1 tool call");
@@ -1347,15 +1357,14 @@ mod tests {
 		let sigs = only_tool.thought_signatures.as_deref().unwrap_or(&[]);
 		assert!(sigs.contains(&"sig_first".to_string()), "sig_first must be attached");
 		// The orphan trailing signature must also be attached to the only call.
-		assert!(sigs.contains(&"sig_orphan".to_string()), "orphan sig_orphan must be attached to last tool call");
+		assert!(
+			sigs.contains(&"sig_orphan".to_string()),
+			"orphan sig_orphan must be attached to last tool call"
+		);
 		assert_eq!(only_tool.thought_signatures_provenance, Some(AdapterKind::Gemini));
 
 		// Both signatures must appear as ThinkingBlock parts.
-		let thinking_sigs: Vec<&str> = chat_response
-			.content
-			.iter()
-			.filter_map(|p| p.as_thought_signature())
-			.collect();
+		let thinking_sigs: Vec<&str> = chat_response.content.iter().filter_map(|p| p.as_thought_signature()).collect();
 		assert!(thinking_sigs.contains(&"sig_first"));
 		assert!(thinking_sigs.contains(&"sig_orphan"));
 	}

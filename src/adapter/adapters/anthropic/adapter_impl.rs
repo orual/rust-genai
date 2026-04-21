@@ -584,9 +584,7 @@ impl AnthropicAdapter {
 
 		// NOTE: For now, this means the first System cannot have a cache control
 		//       so that we do not change too much.
-		if !use_explicit_blocks
-			&& let Some(system) = chat_req.system
-		{
+		if !use_explicit_blocks && let Some(system) = chat_req.system {
 			systems.push((system, None));
 		}
 
@@ -617,9 +615,7 @@ impl AnthropicAdapter {
 				// When explicit `system_blocks` are set, they are authoritative and
 				// system-role messages are dropped from system-prompt construction.
 				ChatRole::System => {
-					if !use_explicit_blocks
-						&& let Some(system_text) = msg.content.joined_texts()
-					{
+					if !use_explicit_blocks && let Some(system_text) = msg.content.joined_texts() {
 						systems.push((system_text, cache_control));
 					}
 				}
@@ -785,7 +781,11 @@ impl AnthropicAdapter {
 								// Assign the full reasoning text to the first block; subsequent
 								// blocks from multi-block interleaved thinking get an empty string
 								// because the per-block text was merged on the inbound path.
-								let thinking_text = if i == 0 { combined_reasoning.clone() } else { String::new() };
+								let thinking_text = if i == 0 {
+									combined_reasoning.clone()
+								} else {
+									String::new()
+								};
 								json!({
 									"type": "thinking",
 									"thinking": thinking_text,
@@ -1422,9 +1422,7 @@ mod tests {
 		]));
 
 		// Turn N tool result (user-role on the Anthropic wire).
-		let tool_result_msg = ChatMessage::tool(
-			crate::chat::ToolResponse::new("toolu_01XYZ", "Sunny, 22°C"),
-		);
+		let tool_result_msg = ChatMessage::tool(crate::chat::ToolResponse::new("toolu_01XYZ", "Sunny, 22°C"));
 
 		// Build the multi-turn request for turn N+1.
 		let req = ChatRequest::new(vec![
@@ -1467,10 +1465,7 @@ mod tests {
 			.iter()
 			.find(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
 			.expect("must have a tool_use block");
-		assert_eq!(
-			tool_use_block.get("id").and_then(|v| v.as_str()),
-			Some("toolu_01XYZ"),
-		);
+		assert_eq!(tool_use_block.get("id").and_then(|v| v.as_str()), Some("toolu_01XYZ"),);
 
 		// Thinking block must appear before tool_use block (Anthropic wire requirement).
 		let thinking_idx = content_arr
@@ -1510,10 +1505,7 @@ mod tests {
 			}),
 		]));
 
-		let req = ChatRequest::new(vec![
-			ChatMessage::user("search for test"),
-			assistant_msg,
-		]);
+		let req = ChatRequest::new(vec![ChatMessage::user("search for test"), assistant_msg]);
 
 		let parts = AnthropicAdapter::into_anthropic_request_parts(req).expect("request parts");
 
@@ -1541,10 +1533,7 @@ mod tests {
 			Some(combined_reasoning),
 			"first thinking block must carry the combined reasoning text"
 		);
-		assert_eq!(
-			thinking_blocks[0].get("signature").and_then(|v| v.as_str()),
-			Some(sig1),
-		);
+		assert_eq!(thinking_blocks[0].get("signature").and_then(|v| v.as_str()), Some(sig1),);
 
 		// Second block gets an empty thinking field (merged-text limitation).
 		assert_eq!(
@@ -1552,10 +1541,7 @@ mod tests {
 			Some(""),
 			"second thinking block must have empty thinking field (merged-text limitation)"
 		);
-		assert_eq!(
-			thinking_blocks[1].get("signature").and_then(|v| v.as_str()),
-			Some(sig2),
-		);
+		assert_eq!(thinking_blocks[1].get("signature").and_then(|v| v.as_str()), Some(sig2),);
 	}
 
 	/// Regression guard: the non-streaming (`to_chat_response`) path must capture both
@@ -1608,8 +1594,8 @@ mod tests {
 		let model_iden = ModelIden::new(AdapterKind::Anthropic, "claude-opus-4-6-20250514");
 		let options_set = ChatOptionsSet::default();
 
-		let chat_response =
-			AnthropicAdapter::to_chat_response(model_iden, web_response, options_set).expect("to_chat_response must succeed");
+		let chat_response = AnthropicAdapter::to_chat_response(model_iden, web_response, options_set)
+			.expect("to_chat_response must succeed");
 
 		// The legacy `reasoning_content` string field must still be populated.
 		assert_eq!(
@@ -1658,10 +1644,7 @@ mod tests {
 		// The regular text part must also be present.
 		let text_part = parts.iter().find(|p| p.is_text());
 		assert!(text_part.is_some(), "content must still contain the text part");
-		assert_eq!(
-			text_part.unwrap().as_text(),
-			Some("The answer is 42."),
-		);
+		assert_eq!(text_part.unwrap().as_text(), Some("The answer is 42."),);
 	}
 
 	/// Verify that a `to_chat_response` thinking block WITHOUT a signature (e.g. from
@@ -1697,15 +1680,18 @@ mod tests {
 		let model_iden = ModelIden::new(AdapterKind::Anthropic, "claude-opus-4-6-20250514");
 		let options_set = ChatOptionsSet::default();
 
-		let chat_response =
-			AnthropicAdapter::to_chat_response(model_iden, web_response, options_set).expect("must succeed without signature");
+		let chat_response = AnthropicAdapter::to_chat_response(model_iden, web_response, options_set)
+			.expect("must succeed without signature");
 
 		// reasoning_content field still populated.
 		assert_eq!(chat_response.reasoning_content.as_deref(), Some(thinking_text));
 
 		// ThinkingBlock part emitted with text.
 		let thinking_part = chat_response.content.iter().find(|p| p.is_thinking_block());
-		assert!(thinking_part.is_some(), "ThinkingBlock part must be emitted even without a signature");
+		assert!(
+			thinking_part.is_some(),
+			"ThinkingBlock part must be emitted even without a signature"
+		);
 		let block = thinking_part.unwrap().as_thinking_block().unwrap();
 		assert_eq!(block.text.as_deref(), Some(thinking_text));
 		assert!(block.signature.is_none(), "unsigned block must have no signature");

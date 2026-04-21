@@ -609,7 +609,10 @@ mod tests {
 		);
 
 		// ToolCall must be present.
-		let tool_calls = assistant_json.get("tool_calls").and_then(|v| v.as_array()).expect("tool_calls must be present");
+		let tool_calls = assistant_json
+			.get("tool_calls")
+			.and_then(|v| v.as_array())
+			.expect("tool_calls must be present");
 		assert_eq!(tool_calls.len(), 1);
 		assert_eq!(tool_calls[0]["function"]["name"], "lookup");
 	}

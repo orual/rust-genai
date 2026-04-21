@@ -96,8 +96,10 @@ impl ChatMessage {
 	/// actual adapter should construct a `ThinkingBlock` directly.
 	pub fn with_reasoning_content(mut self, reasoning: Option<String>) -> Self {
 		if let Some(text) = reasoning {
-			self.content
-				.push(ContentPart::ThinkingBlock(ThinkingBlock::unsigned(AdapterKind::OpenAI, text)));
+			self.content.push(ContentPart::ThinkingBlock(ThinkingBlock::unsigned(
+				AdapterKind::OpenAI,
+				text,
+			)));
 		}
 		self
 	}
@@ -213,9 +215,7 @@ impl From<Vec<ToolCall>> for ChatMessage {
 		if let Some(first) = tool_calls.first()
 			&& let Some(thoughts) = &first.thought_signatures
 		{
-			let provenance = first
-				.thought_signatures_provenance
-				.unwrap_or(AdapterKind::Anthropic);
+			let provenance = first.thought_signatures_provenance.unwrap_or(AdapterKind::Anthropic);
 			let mut parts: Vec<ContentPart> = thoughts
 				.iter()
 				.cloned()

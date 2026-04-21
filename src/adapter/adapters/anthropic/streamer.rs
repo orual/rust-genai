@@ -1,7 +1,7 @@
+use crate::adapter::AdapterKind;
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::anthropic::parse_cache_creation_details;
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
-use crate::adapter::AdapterKind;
 use crate::chat::{ChatOptionsSet, PromptTokensDetails, StopReason, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
@@ -24,12 +24,19 @@ pub struct AnthropicStreamer {
 
 enum InProgressBlock {
 	Text,
-	ToolUse { id: String, name: String, input: String },
+	ToolUse {
+		id: String,
+		name: String,
+		input: String,
+	},
 	/// Accumulates the thinking text and signature for the current thinking block.
 	/// Anthropic delivers the signature as a single `delta/signature` event at the
 	/// end of each thinking block, but we store it on the block so it stays paired
 	/// with the block's reasoning text when we capture it at `content_block_stop`.
-	Thinking { reasoning: String, signature: Option<String> },
+	Thinking {
+		reasoning: String,
+		signature: Option<String>,
+	},
 }
 
 impl AnthropicStreamer {

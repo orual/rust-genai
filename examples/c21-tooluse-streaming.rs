@@ -152,9 +152,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		// We can convert to Vec, insert, and convert back.
 		let mut parts = assistant_msg.content.into_parts();
 		for thought in thoughts.into_iter().rev() {
-			parts.insert(0, genai::chat::ContentPart::ThinkingBlock(genai::chat::ThinkingBlock::signed(
-				genai::adapter::AdapterKind::Gemini, "", thought,
-			)));
+			parts.insert(
+				0,
+				genai::chat::ContentPart::ThinkingBlock(genai::chat::ThinkingBlock::signed(
+					genai::adapter::AdapterKind::Gemini,
+					"",
+					thought,
+				)),
+			);
 		}
 		assistant_msg.content = genai::chat::MessageContent::from_parts(parts);
 	}

@@ -247,6 +247,9 @@ impl Adapter for AnthropicAdapter {
 		// -- url
 		let url = Self::get_service_url(&model, service_type, endpoint)?;
 
+		// -- Detect OAuth by checking if api_key starts with "Bearer "
+		let is_oauth = api_key.starts_with("Bearer ");
+
 		// -- headers
 		let headers = Headers::from(vec![
 			("x-api-key".to_string(), api_key),
@@ -258,7 +261,7 @@ impl Adapter for AnthropicAdapter {
 			system,
 			messages,
 			tools,
-		} = Self::into_anthropic_request_parts(chat_req)?;
+		} = Self::into_anthropic_request_parts(chat_req, is_oauth, thinking_enabled)?;
 
 		// -- Extract Model Name and Reasoning
 		let (_, raw_model_name) = model.model_name.namespace_and_name();
@@ -352,8 +355,54 @@ impl Adapter for AnthropicAdapter {
 		let max_tokens = Self::resolve_max_tokens(model_name, &options_set);
 		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
 
+		// -- Add thinking configuration if enabled
+		if thinking_enabled {
+			// Convert reasoning effort to budget tokens
+			let budget_tokens = match options_set.reasoning_effort() {
+				Some(ReasoningEffort::Low) => 4096,     // 4k tokens
+				Some(ReasoningEffort::Medium) => 16384, // 16k tokens (recommended starting point)
+				Some(ReasoningEffort::High) => 32768,   // 32k tokens
+				Some(ReasoningEffort::Budget(b)) => *b as u32,
+				None => 16384, // Default to medium if thinking is enabled
+			};
+
+			// Ensure budget is at least 1024 (Anthropic minimum)
+			let budget_tokens = budget_tokens.max(1024);
+
+			// Ensure budget is less than max_tokens
+			let budget_tokens = budget_tokens.min(max_tokens.saturating_sub(100));
+
+			let thinking = json!({
+				"type": "enabled",
+				"budget_tokens": budget_tokens
+			});
+			payload.x_insert("thinking", thinking)?;
+		}
+
+		// -- Add other supported ChatOptions
+		// Temperature cannot be set when thinking is enabled
+		if !thinking_enabled {
+			if let Some(temperature) = options_set.temperature() {
+				payload.x_insert("temperature", temperature)?;
+			}
+		}
+
+		if !options_set.stop_sequences().is_empty() {
+			payload.x_insert("stop_sequences", options_set.stop_sequences())?;
+		}
+
+		// top_p restrictions when thinking is enabled
 		if let Some(top_p) = options_set.top_p() {
-			payload.x_insert("top_p", top_p)?;
+			if thinking_enabled {
+				// When thinking is enabled, top_p must be between 0.95 and 1
+				if top_p >= 0.95 && top_p <= 1.0 {
+					payload.x_insert("top_p", top_p)?;
+				}
+				// Otherwise skip setting top_p
+			} else {
+				// Normal top_p when thinking is disabled
+				payload.x_insert("top_p", top_p)?;
+			}
 		}
 
 		Ok(WebRequestData { url, headers, payload })
@@ -384,9 +433,7 @@ impl Adapter for AnthropicAdapter {
 		// -- Capture the content
 		let mut content: MessageContent = MessageContent::default();
 
-		// NOTE: Here we are going to concatenate all of the Anthropic text content items into one
-		//       genai MessageContent::Text. This is more in line with the OpenAI API style,
-		//       but loses the fact that they were originally separate items.
+		// -- Process content items
 		let json_content_items: Vec<Value> = body.x_take("content")?;
 
 		let mut reasoning_content: Vec<String> = Vec::new();
@@ -871,12 +918,36 @@ impl AnthropicAdapter {
 					.collect();
 				json!(parts)
 			} else {
-				let content_buff = systems.iter().map(|(content, _)| content.as_str()).collect::<Vec<&str>>();
-				// we add empty line in between each system
-				let content = content_buff.join("\n\n");
-				json!(content)
-			};
-			Some(system)
+				// Non-OAuth uses existing logic
+				let mut last_cache_idx = -1;
+				// first determine the last cache control index
+				for (idx, (_, is_cache_control)) in systems.iter().enumerate() {
+					if *is_cache_control {
+						last_cache_idx = idx as i32;
+					}
+				}
+				// Now build the system multi part
+				let system: Value = if last_cache_idx > 0 {
+					let mut parts: Vec<Value> = Vec::new();
+					for (idx, (content, _)) in systems.iter().enumerate() {
+						let idx = idx as i32;
+						if idx == last_cache_idx {
+							let part = json!({"type": "text", "text": content, "cache_control": {"type": "ephemeral", "ttl": "1h"}});
+							parts.push(part);
+						} else {
+							let part = json!({"type": "text", "text": content});
+							parts.push(part);
+						}
+					}
+					json!(parts)
+				} else {
+					let content_buff = systems.iter().map(|(content, _)| content.as_str()).collect::<Vec<&str>>();
+					// we add empty line in between each system
+					let content = content_buff.join("\n\n");
+					json!(content)
+				};
+				Some(system)
+			}
 		} else {
 			None
 		};
@@ -892,6 +963,10 @@ impl AnthropicAdapter {
 					.collect::<Result<Vec<Value>>>()
 			})
 			.transpose()?;
+
+		if let Some(tool) = tools.as_mut().and_then(|t| t.last_mut()).and_then(|t| t.as_object_mut()) {
+			tool.insert("cache_control".to_string(), json!({"type": "ephemeral", "ttl": "1h"}));
+		}
 
 		Ok(AnthropicRequestParts {
 			system,

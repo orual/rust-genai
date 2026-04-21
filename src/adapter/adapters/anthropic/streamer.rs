@@ -195,6 +195,10 @@ impl futures::Stream for AnthropicStreamer {
 										continue;
 									}
 								}
+								InProgressBlock::RedactedThinking { .. } => {
+									// Redacted thinking blocks don't have delta content, just skip
+									continue;
+								}
 							}
 						}
 						"content_block_stop" => {

@@ -42,6 +42,7 @@ impl ToolResponse {
 		Self {
 			call_id: tool_call_id.into(),
 			content: content.into(),
+			is_error: None,
 		}
 	}
 }

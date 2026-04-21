@@ -79,6 +79,8 @@ const MODEL_ZAI: &str = "glm-4-plus";
 const MODEL_COHERE: &str = "command-r7b-12-2024";
 // or any publisher: "github_copilot::anthropic/claude-sonnet-4-6", "github_copilot::google/gemini-2.5-pro", "github_copilot::xai/grok-3-mini"
 const MODEL_GITHUB_COPILOT: &str = "github_copilot::openai/gpt-4.1-mini";
+// OpenRouter - Unified API for 100+ models (use namespaced model names)
+const MODEL_OPENROUTER: &str = "openrouter::anthropic/claude-sonnet-4";
 
 // NOTE: These are the default environment keys for each AI Adapter Type.
 //       They can be customized; see `examples/c02-auth.rs`
@@ -92,6 +94,7 @@ const MODEL_AND_KEY_ENV_NAME_LIST: &[(&str, &str)] = &[
 	(MODEL_GROQ, "GROQ_API_KEY"),
 	(MODEL_XAI, "XAI_API_KEY"),
 	(MODEL_DEEPSEEK, "DEEPSEEK_API_KEY"),
+	(MODEL_OPENROUTER, "OPENROUTER_API_KEY"),
 	(MODEL_OLLAMA, ""),
 	(MODEL_OLLAMA_CLOUD, "OLLAMA_API_KEY"),
 	(MODEL_ZAI, "ZAI_API_KEY"),
@@ -108,6 +111,7 @@ const MODEL_AND_KEY_ENV_NAME_LIST: &[(&str, &str)] = &[
 //  - starts_with "glm"      -> ZAI
 //  - starts_with "ollama_cloud::" -> OllamaCloud
 //  - For anything else      -> Ollama
+//  - Use namespacing for OpenRouter: "openrouter::provider/model-name"
 //
 // This can be customized; see `examples/c03-mapper.rs`
 

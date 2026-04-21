@@ -10,12 +10,21 @@ pub struct WebClient {
 	reqwest_client: reqwest::Client,
 }
 
-// Implements Default
+// Implements Default with performance optimizations
 impl Default for WebClient {
 	fn default() -> Self {
-		WebClient {
-			reqwest_client: reqwest::Client::new(),
-		}
+		use std::time::Duration;
+		let reqwest_client = reqwest::Client::builder()
+			.tcp_nodelay(true)
+			.gzip(true)
+			.pool_max_idle_per_host(4)
+			.http2_keep_alive_interval(Some(Duration::from_secs(20)))
+			.http2_keep_alive_timeout(Duration::from_secs(10))
+			.http2_keep_alive_while_idle(true)
+			.http2_adaptive_window(true)
+			.build()
+			.expect("Failed to build default reqwest client");
+		WebClient { reqwest_client }
 	}
 }
 
@@ -32,7 +41,7 @@ impl WebClient {
 // region:    --- Web Method Implementation
 
 impl WebClient {
-	pub async fn do_get(&self, url: &str, headers: &[(String, String)]) -> Result<WebResponse> {
+	pub async fn do_get(&self, url: &str, headers: &Headers) -> Result<WebResponse> {
 		let mut reqwest_builder = self.reqwest_client.request(Method::GET, url);
 
 		for (k, v) in headers.iter() {
@@ -45,7 +54,7 @@ impl WebClient {
 		Ok(response)
 	}
 
-	pub async fn do_post(&self, url: &str, headers: &Headers, content: Value) -> Result<WebResponse> {
+	pub async fn do_post(&self, url: &str, headers: &Headers, content: &Value) -> Result<WebResponse> {
 		let reqwest_builder = self.new_req_builder(url, headers, content)?;
 
 		let reqwest_res = reqwest_builder.send().await?;
@@ -55,14 +64,14 @@ impl WebClient {
 		Ok(response)
 	}
 
-	pub fn new_req_builder(&self, url: &str, headers: &Headers, content: Value) -> Result<RequestBuilder> {
+	pub fn new_req_builder(&self, url: &str, headers: &Headers, content: &Value) -> Result<RequestBuilder> {
 		let method = Method::POST;
 
 		let mut reqwest_builder = self.reqwest_client.request(method, url);
 		for (k, v) in headers.iter() {
 			reqwest_builder = reqwest_builder.header(k, v);
 		}
-		reqwest_builder = reqwest_builder.json(&content);
+		reqwest_builder = reqwest_builder.json(content);
 
 		Ok(reqwest_builder)
 	}
@@ -92,6 +101,7 @@ impl WebResponse {
 		if !status.is_success() {
 			let headers = res.headers().clone();
 			let body = res.text().await?;
+			tracing::trace!("AI Response failed. Body:\n{body}");
 			return Err(Error::ResponseFailedStatus {
 				status,
 				body,
@@ -105,11 +115,19 @@ impl WebResponse {
 
 		// Capture the body
 		let ct = header_map.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+		let body = res.text().await?;
+
 		let body = if ct.starts_with("application/json") {
-			res.json::<Value>().await?
+			tracing::trace!("AI Response body:\n{body}");
+			let value: Value = serde_json::from_str(&body).map_err(|err| Error::ResponseFailedInvalidJson {
+				body,
+				cause: err.to_string(),
+			})?;
+			value
 		} else {
 			return Err(Error::ResponseFailedNotJson {
 				content_type: ct.to_string(),
+				body,
 			});
 		};
 

@@ -1,165 +1,205 @@
-//! ChatOptions allows customization of a chat request.
-//! - It can be provided at the `client::exec_chat(..)` level as an argument,
-//! - or set in the client config `client_config.with_chat_options(..)` to be used as the default for all requests
+//! ChatOptions configures a chat request.
+//! - It can be passed to `client::exec_chat(...)`, or
+//! - set as a default on the client via `client_config.with_chat_options(...)`.
 //!
-//! Note 1: In the future, we will probably allow setting the client
-//! Note 2: Extracting it from the `ChatRequest` object allows for better reusability of each component.
+//! Note 1: Additional client-level defaults may be added over time.
+//! Note 2: Kept separate from `ChatRequest` for easier reuse and composition.
 
 use crate::Headers;
+use crate::chat::CacheControl;
 use crate::chat::chat_req_response_format::ChatResponseFormat;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
 
-/// Chat Options that are considered for any `Client::exec...` calls.
+/// Options considered by all `Client::exec_*` chat calls.
 ///
-/// A fallback `ChatOptions` can also be set at the `Client` during the client builder phase
-/// ``
+/// A default can be set on the `Client` during builder configuration.
+/// Per-call options take precedence over client defaults.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatOptions {
-	/// Will be used for this request if the Adapter/provider supports it.
+	/// Sampling temperature (if supported by the provider).
 	pub temperature: Option<f64>,
 
-	/// Will be used for this request if the Adapter/provider supports it.
+	/// Maximum tokens to generate (if supported).
 	pub max_tokens: Option<u32>,
 
-	/// Will be used for this request if the Adapter/provider supports it.
+	/// Nucleus sampling (top-p), if supported.
 	pub top_p: Option<f64>,
 
-	/// Specifies sequences used as end markers when generating text
+	/// Sequences that halt generation when encountered.
 	pub stop_sequences: Vec<String>,
 
 	// -- Stream Options
-	/// (for streaming only) Capture the meta usage when in stream mode
-	/// `StreamEnd` event payload will contain `captured_usage`
-	/// > Note: Will capture the `MetaUsage`
+	/// (streaming) Capture usage metadata; available in `StreamEnd.captured_usage`.
 	pub capture_usage: Option<bool>,
 
-	/// (for streaming only) Capture/concatenate the full message content from all content chunks
-	/// `StreamEnd` from `StreamEvent::End(StreamEnd)` will contain `StreamEnd.captured_content`
+	/// (streaming) Concatenate content chunks; available in `StreamEnd.captured_content`.
 	pub capture_content: Option<bool>,
 
-	/// (for streaming only) Capture/concatenate the full message content from all content chunks
-	/// `StreamEnd` from `StreamEvent::End(StreamEnd)` will contain `StreamEnd.captured_reasoning_content`
+	/// (streaming) Concatenate reasoning chunks; available in `StreamEnd.captured_reasoning_content`.
 	pub capture_reasoning_content: Option<bool>,
 
-	/// (for streaming only) Capture all tool calls from tool call chunks
-	/// `StreamEnd` from `StreamEvent::End(StreamEnd)` will contain `StreamEnd.captured_tool_calls`
+	/// (streaming) Collect tool calls; available in `StreamEnd.captured_tool_calls`.
 	pub capture_tool_calls: Option<bool>,
 
+	/// Capture the raw HTTP body (primarily for debugging/inspection).
 	pub capture_raw_body: Option<bool>,
 
-	/// Specifies the response format for a chat request.
-	/// - `ChatResponseFormat::JsonMode` is for OpenAI-like API usage, where the user must specify in the prompt that they want a JSON format response.
+	/// Desired response format (e.g., `ChatResponseFormat::JsonMode` for OpenAI-style JSON mode).
 	///
-	/// NOTE: More response formats are coming soon.
+	/// Note: Additional formats may be added in the future.
 	pub response_format: Option<ChatResponseFormat>,
 
 	// -- Reasoning options
-	/// Denote if the content should be parsed to extract eventual `<think>...</think>` content
-	/// into `ChatResponse.reasoning_content`
+	/// Extract -style reasoning blocks into `ChatResponse.reasoning_content` when present.
 	pub normalize_reasoning_content: Option<bool>,
 
+	/// Preferred reasoning effort, when supported by the provider.
 	pub reasoning_effort: Option<ReasoningEffort>,
 
-	/// Set the seed
-	/// This is useful for reproducibility.
+	/// Verbosity (for OpenAI gpt-5),
+	pub verbosity: Option<Verbosity>,
+
+	/// Seed for repeatability, if supported.
 	pub seed: Option<u64>,
 
-	// Extra headers
+	/// Service tier preference (OpenAI-specific, for flex processing).
+	pub service_tier: Option<ServiceTier>,
+
+	/// Additional HTTP headers to include with the request.
 	pub extra_headers: Option<Headers>,
+
+	// -- Prompt cache options
+	/// Request-level cache control preference.
+	pub cache_control: Option<CacheControl>,
+
+	/// OpenAI prompt cache key.
+	pub prompt_cache_key: Option<String>,
 }
 
 /// Chainable Setters
 impl ChatOptions {
-	/// Set the `temperature` for this request.
+	/// Sets the sampling temperature.
 	pub fn with_temperature(mut self, value: f64) -> Self {
 		self.temperature = Some(value);
 		self
 	}
 
-	/// Set the `max_tokens` for this request.
+	/// Sets the maximum number of output tokens.
 	pub fn with_max_tokens(mut self, value: u32) -> Self {
 		self.max_tokens = Some(value);
 		self
 	}
 
-	/// Set the `top_p` for this request.
+	/// Sets nucleus sampling (top-p).
 	pub fn with_top_p(mut self, value: f64) -> Self {
 		self.top_p = Some(value);
 		self
 	}
 
-	/// Set the `capture_usage` for this request.
+	/// Enables or disables capturing usage in streaming mode.
 	pub fn with_capture_usage(mut self, value: bool) -> Self {
 		self.capture_usage = Some(value);
 		self
 	}
 
-	/// Set the `capture_content` for this request.
+	/// Enables or disables capturing concatenated content in streaming mode.
 	pub fn with_capture_content(mut self, value: bool) -> Self {
 		self.capture_content = Some(value);
 		self
 	}
 
-	/// Set the `capture_reasoning_content` for this request.
+	/// Enables or disables capturing concatenated reasoning content in streaming mode.
 	pub fn with_capture_reasoning_content(mut self, value: bool) -> Self {
 		self.capture_reasoning_content = Some(value);
 		self
 	}
 
-	/// Set the `capture_tool_calls` for this request.
+	/// Enables or disables capturing tool calls in streaming mode.
 	pub fn with_capture_tool_calls(mut self, value: bool) -> Self {
 		self.capture_tool_calls = Some(value);
 		self
 	}
 
+	/// Enables or disables capturing the raw HTTP body.
 	pub fn with_capture_raw_body(mut self, value: bool) -> Self {
 		self.capture_raw_body = Some(value);
 		self
 	}
 
+	/// Sets the stop sequences.
 	pub fn with_stop_sequences(mut self, values: Vec<String>) -> Self {
 		self.stop_sequences = values;
 		self
 	}
 
+	/// Appends one stop sequence.
+	pub fn with_stop_sequence(mut self, value: impl Into<String>) -> Self {
+		self.stop_sequences.push(value.into());
+		self
+	}
+
+	/// Enables or disables normalization of reasoning content (e.g., `<think>...</think>`).
 	pub fn with_normalize_reasoning_content(mut self, value: bool) -> Self {
 		self.normalize_reasoning_content = Some(value);
 		self
 	}
 
-	/// Set the `response_format` for this request.
+	/// Sets the response format.
 	pub fn with_response_format(mut self, res_format: impl Into<ChatResponseFormat>) -> Self {
 		self.response_format = Some(res_format.into());
 		self
 	}
 
+	/// Sets the reasoning effort hint.
 	pub fn with_reasoning_effort(mut self, value: ReasoningEffort) -> Self {
 		self.reasoning_effort = Some(value);
 		self
 	}
 
+	/// Sets the verbosity hint.
+	pub fn with_verbosity(mut self, value: Verbosity) -> Self {
+		self.verbosity = Some(value);
+		self
+	}
+
+	/// Sets the deterministic seed.
 	pub fn with_seed(mut self, value: u64) -> Self {
 		self.seed = Some(value);
 		self
 	}
 
+	/// Sets the service tier preference (OpenAI-specific).
+	pub fn with_service_tier(mut self, value: ServiceTier) -> Self {
+		self.service_tier = Some(value);
+		self
+	}
+
+	/// Adds extra HTTP headers.
 	pub fn with_extra_headers(mut self, headers: impl Into<Headers>) -> Self {
 		self.extra_headers = Some(headers.into());
 		self
 	}
 
+	/// Sets the request-level cache control preference.
+	pub fn with_cache_control(mut self, value: CacheControl) -> Self {
+		self.cache_control = Some(value);
+		self
+	}
+
+	/// Sets the OpenAI prompt cache key.
+	pub fn with_prompt_cache_key(mut self, key: impl Into<String>) -> Self {
+		self.prompt_cache_key = Some(key.into());
+		self
+	}
+
 	// -- Deprecated
 
-	/// Set the `json_mode` for this request.
+	/// Deprecated: use `with_response_format(ChatResponseFormat::JsonMode)`.
 	///
-	/// IMPORTANT: This is deprecated now; use `with_response_format(ChatResponseFormat::JsonMode)`
-	///
-	/// IMPORTANT: When this is JsonMode, it's important to instruct the model to produce JSON yourself
-	///            for many models/providers to work correctly. This can be approximately done
-	///            by checking if any System and potentially User messages contain `"json"`
-	///            (make sure to check the `.system` property as well).
+	/// When using JSON mode, you should still instruct the model to produce JSON in your prompt
+	/// for broad provider compatibility (e.g., mention "json" in system/user messages).
 	#[deprecated(note = "Use with_response_format(ChatResponseFormat::JsonMode)")]
 	pub fn with_json_mode(mut self, value: bool) -> Self {
 		if value {
@@ -171,60 +211,75 @@ impl ChatOptions {
 
 // region:    --- ReasoningEffort
 
+/// Provider-specific hint for reasoning intensity/budget.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReasoningEffort {
+	None,
 	Low,
 	Medium,
 	High,
+	XHigh,
+	Max,
 	Budget(u32),
+
+	// Legacy reasoning for <= gpt-5
+	Minimal,
 }
 
 impl ReasoningEffort {
-	/// Returns the lowercase, static variant name.
-	/// Budget always returns "budget" regardless of the number.
+	/// Returns the lowercase variant name.
 	pub fn variant_name(&self) -> &'static str {
 		match self {
+			ReasoningEffort::None => "none",
 			ReasoningEffort::Low => "low",
 			ReasoningEffort::Medium => "medium",
 			ReasoningEffort::High => "high",
+			ReasoningEffort::XHigh => "xhigh",
+			ReasoningEffort::Max => "max",
 			ReasoningEffort::Budget(_) => "budget",
+			// Legacy
+			ReasoningEffort::Minimal => "minimal",
 		}
 	}
 
-	/// Keywords are just the "high", "medium", "low",
-	/// Budget will be None
+	/// Returns a keyword for non-`Budget` variants; `None` for `Budget(_)`.
 	pub fn as_keyword(&self) -> Option<&'static str> {
 		match self {
+			ReasoningEffort::None => Some("none"),
 			ReasoningEffort::Low => Some("low"),
 			ReasoningEffort::Medium => Some("medium"),
 			ReasoningEffort::High => Some("high"),
+			ReasoningEffort::XHigh => Some("xhigh"),
+			ReasoningEffort::Max => Some("max"),
 			ReasoningEffort::Budget(_) => None,
+			// Legacy
+			ReasoningEffort::Minimal => Some("minimal"),
 		}
 	}
 
-	/// Keywords are just the "high", "medium", "low",
-	/// This function will not create budget variant (no)
+	/// Parses a verbosity keyword.
 	pub fn from_keyword(name: &str) -> Option<Self> {
 		match name {
+			"none" => Some(ReasoningEffort::None),
 			"low" => Some(ReasoningEffort::Low),
 			"medium" => Some(ReasoningEffort::Medium),
 			"high" => Some(ReasoningEffort::High),
+			"xhigh" => Some(ReasoningEffort::XHigh),
+			"max" => Some(ReasoningEffort::Max),
+			// legacy
+			"minimal" => Some(ReasoningEffort::Minimal),
 			_ => None,
 		}
 	}
 
-	/// If the model_name ends with the lowercase string of a ReasoningEffort variant,
-	/// return the ReasoningEffort and the trimmed model_name.
+	/// If `model_name` ends with `-reasoning_effort`, returns the parsed verbosity and the trimmed name.
 	///
-	/// Otherwise, return the model_name as is.
-	///
-	/// This will not create budget variant, only the keyword one
-	/// Returns (reasoning_effort, model_name)
+	/// Returns `(reasosing_effort?, trimmed_model_name)`.
 	pub fn from_model_name(model_name: &str) -> (Option<Self>, &str) {
-		if let Some((prefix, last)) = model_name.rsplit_once('-') {
-			if let Some(effort) = ReasoningEffort::from_keyword(last) {
-				return (Some(effort), prefix);
-			}
+		if let Some((prefix, last)) = model_name.rsplit_once('-')
+			&& let Some(effort) = ReasoningEffort::from_keyword(last)
+		{
+			return (Some(effort), prefix);
 		}
 		(None, model_name)
 	}
@@ -233,10 +288,15 @@ impl ReasoningEffort {
 impl std::fmt::Display for ReasoningEffort {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
+			ReasoningEffort::None => write!(f, "none"),
 			ReasoningEffort::Low => write!(f, "low"),
 			ReasoningEffort::Medium => write!(f, "medium"),
 			ReasoningEffort::High => write!(f, "high"),
+			ReasoningEffort::XHigh => write!(f, "xhigh"),
+			ReasoningEffort::Max => write!(f, "max"),
 			ReasoningEffort::Budget(n) => write!(f, "{n}"),
+			// Legacy
+			ReasoningEffort::Minimal => write!(f, "minimal"),
 		}
 	}
 }
@@ -244,6 +304,7 @@ impl std::fmt::Display for ReasoningEffort {
 impl std::str::FromStr for ReasoningEffort {
 	type Err = Error;
 
+	/// Parses a verbosity keyword.
 	fn from_str(s: &str) -> Result<Self> {
 		Self::from_keyword(s)
 			.or_else(|| s.parse::<u32>().ok().map(Self::Budget))
@@ -252,6 +313,144 @@ impl std::str::FromStr for ReasoningEffort {
 }
 
 // endregion: --- ReasoningEffort
+
+// region:    --- Verbosity
+
+/// Provider-specific hint for verbosity intensity/budget.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Verbosity {
+	Low,
+	Medium,
+	High,
+}
+
+impl Verbosity {
+	/// Returns the lowercase variant name; `Budget(_)` returns `"budget"`.
+	pub fn variant_name(&self) -> &'static str {
+		match self {
+			Verbosity::Low => "low",
+			Verbosity::Medium => "medium",
+			Verbosity::High => "high",
+		}
+	}
+
+	/// Returns the verbosity keyword.
+	pub fn as_keyword(&self) -> Option<&'static str> {
+		match self {
+			Verbosity::Low => Some("low"),
+			Verbosity::Medium => Some("medium"),
+			Verbosity::High => Some("high"),
+		}
+	}
+
+	/// Parses a keyword into a non-`Budget` variant.
+	pub fn from_keyword(name: &str) -> Option<Self> {
+		match name {
+			"low" => Some(Verbosity::Low),
+			"medium" => Some(Verbosity::Medium),
+			"high" => Some(Verbosity::High),
+			_ => None,
+		}
+	}
+
+	/// If `model_name` ends with `-<effort>`, returns the parsed effort and the trimmed name.
+	///
+	/// Only keyword variants are produced; `Budget` is never created here.
+	/// Returns `(effort, trimmed_model_name)`.
+	pub fn from_model_name(model_name: &str) -> (Option<Self>, &str) {
+		if let Some((prefix, last)) = model_name.rsplit_once('-')
+			&& let Some(effort) = Verbosity::from_keyword(last)
+		{
+			return (Some(effort), prefix);
+		}
+		(None, model_name)
+	}
+}
+
+impl std::fmt::Display for Verbosity {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Verbosity::Low => write!(f, "low"),
+			Verbosity::Medium => write!(f, "medium"),
+			Verbosity::High => write!(f, "high"),
+		}
+	}
+}
+
+impl std::str::FromStr for Verbosity {
+	type Err = Error;
+
+	/// Parses a keyword effort or a numeric budget.
+	fn from_str(s: &str) -> Result<Self> {
+		Self::from_keyword(s).ok_or(Error::VerbosityParsing { actual: s.to_string() })
+	}
+}
+
+// endregion: --- Verbosity
+
+// region:    --- ServiceTier
+
+/// OpenAI service tier preference for flex processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ServiceTier {
+	/// Flex processing - lower costs, slower response times
+	Flex,
+	/// Auto - standard processing (default)
+	Auto,
+	/// Default - standard processing
+	Default,
+}
+
+impl ServiceTier {
+	/// Returns the lowercase variant name.
+	pub fn variant_name(&self) -> &'static str {
+		match self {
+			ServiceTier::Flex => "flex",
+			ServiceTier::Auto => "auto",
+			ServiceTier::Default => "default",
+		}
+	}
+
+	/// Returns the keyword for API usage.
+	pub fn as_keyword(&self) -> Option<&'static str> {
+		match self {
+			ServiceTier::Flex => Some("flex"),
+			ServiceTier::Auto => Some("auto"),
+			ServiceTier::Default => Some("default"),
+		}
+	}
+
+	/// Parses a service tier keyword.
+	pub fn from_keyword(name: &str) -> Option<Self> {
+		match name {
+			"flex" => Some(ServiceTier::Flex),
+			"auto" => Some(ServiceTier::Auto),
+			"default" => Some(ServiceTier::Default),
+			_ => None,
+		}
+	}
+}
+
+impl std::fmt::Display for ServiceTier {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ServiceTier::Flex => write!(f, "flex"),
+			ServiceTier::Auto => write!(f, "auto"),
+			ServiceTier::Default => write!(f, "default"),
+		}
+	}
+}
+
+impl std::str::FromStr for ServiceTier {
+	type Err = Error;
+
+	/// Parses a service tier keyword.
+	fn from_str(s: &str) -> Result<Self> {
+		Self::from_keyword(s).ok_or(Error::ServiceTierParsing { actual: s.to_string() })
+	}
+}
+
+// endregion: --- ServiceTier
 
 // region:    --- ChatOptionsSet
 
@@ -349,16 +548,41 @@ impl ChatOptionsSet<'_, '_> {
 			.or_else(|| self.client.and_then(|client| client.reasoning_effort.as_ref()))
 	}
 
+	pub fn verbosity(&self) -> Option<&Verbosity> {
+		self.chat
+			.and_then(|chat| chat.verbosity.as_ref())
+			.or_else(|| self.client.and_then(|client| client.verbosity.as_ref()))
+	}
+
 	pub fn seed(&self) -> Option<u64> {
 		self.chat
 			.and_then(|chat| chat.seed)
 			.or_else(|| self.client.and_then(|client| client.seed))
 	}
 
+	pub fn service_tier(&self) -> Option<&ServiceTier> {
+		self.chat
+			.and_then(|chat| chat.service_tier.as_ref())
+			.or_else(|| self.client.and_then(|client| client.service_tier.as_ref()))
+	}
+
+	#[allow(unused)]
 	pub fn extra_headers(&self) -> Option<&Headers> {
 		self.chat
 			.and_then(|chat| chat.extra_headers.as_ref())
 			.or_else(|| self.client.and_then(|client| client.extra_headers.as_ref()))
+	}
+
+	pub fn prompt_cache_key(&self) -> Option<&str> {
+		self.chat
+			.and_then(|chat| chat.prompt_cache_key.as_deref())
+			.or_else(|| self.client.and_then(|client| client.prompt_cache_key.as_deref()))
+	}
+
+	pub fn cache_control(&self) -> Option<&CacheControl> {
+		self.chat
+			.and_then(|chat| chat.cache_control.as_ref())
+			.or_else(|| self.client.and_then(|client| client.cache_control.as_ref()))
 	}
 
 	/// Returns true only if there is a ChatResponseFormat::JsonMode

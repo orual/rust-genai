@@ -2,7 +2,11 @@ use crate::adapter::AdapterKind;
 use crate::chat::ChatRole;
 use crate::{ModelIden, resolver, webc};
 use derive_more::{Display, From};
+use reqwest::StatusCode;
 use value_ext::JsonValueExtError;
+
+/// Type alias for boxed errors that are Send + Sync
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// GenAI main Result type alias (with genai::Error)
 pub type Result<T> = core::result::Result<T, Error>;
@@ -30,8 +34,17 @@ pub enum Error {
 	#[display("JSON mode requested but no instruction/prompt provided.")]
 	JsonModeWithoutInstruction,
 
+	#[display("Failed to parse verbosity. Actual: '{actual}'")]
+	VerbosityParsing { actual: String },
+
 	#[display("Failed to parse reasoning. Actual: '{actual}'")]
 	ReasoningParsingError { actual: String },
+
+	#[display("Failed to parse service tier. Actual: '{actual}'")]
+	ServiceTierParsing { actual: String },
+
+	#[display("Failed to parse prompt cache retention. Actual: '{actual}'")]
+	PromptCacheRetentionParsing { actual: String },
 
 	// -- Chat Output
 	#[display("No chat response from model '{model_iden}'")]
@@ -70,6 +83,27 @@ pub enum Error {
 		webc_error: webc::Error,
 	},
 
+	#[display(
+		"Error while generating a ChatResponse from a ChatRequest. (for Model: '{model_iden}')
+Request Payload:\n{request_payload:#}
+Response Body:\n{response_body:#}
+Cause:\n{cause}
+"
+	)]
+	ChatResponseGeneration {
+		model_iden: ModelIden,
+		request_payload: Box<serde_json::Value>,
+		/// Require ChatOptions::default().with_capture_raw_body(true); otherwise "null"
+		response_body: Box<serde_json::Value>,
+		cause: String,
+	},
+
+	#[display("Error event in stream for model '{model_iden}'. Body: {body}")]
+	ChatResponse {
+		model_iden: ModelIden,
+		body: serde_json::Value,
+	},
+
 	// -- Chat Stream
 	#[display("Failed to parse stream data for model '{model_iden}'.\nCause: {serde_error}")]
 	StreamParse {
@@ -77,14 +111,26 @@ pub enum Error {
 		serde_error: serde_json::Error,
 	},
 
-	#[display("Error event in stream for model '{model_iden}'. Body: {body}")]
-	StreamEventError {
+	#[display("Web stream error for model '{model_iden}'.\nCause: {cause}")]
+	WebStream {
 		model_iden: ModelIden,
-		body: serde_json::Value,
+		cause: String,
+		error: BoxError,
 	},
 
-	#[display("Web stream error for model '{model_iden}'.\nCause: {cause}")]
-	WebStream { model_iden: ModelIden, cause: String },
+	#[display("HTTP error.\nStatus: {status} {canonical_reason}\nBody: {body}")]
+	HttpError {
+		status: StatusCode,
+		canonical_reason: String,
+		body: String,
+		/// Response headers captured at the point of failure. Boxed to
+		/// keep the `Error` enum size small (HeaderMap is ~48 bytes +
+		/// content). Consumers can read `Retry-After`, tier-specific
+		/// rate-limit reset headers, and request-id correlation info
+		/// without losing information that's only available at the
+		/// protocol layer.
+		headers: Box<reqwest::header::HeaderMap>,
+	},
 
 	// -- Modules
 	#[display("Resolver error for model '{model_iden}'.\nCause: {resolver_error}")]
@@ -97,17 +143,13 @@ pub enum Error {
 	#[display("Adapter '{adapter_kind}' does not support feature '{feature}'")]
 	AdapterNotSupported { adapter_kind: AdapterKind, feature: String },
 
-	// -- Externals
-	#[display("Failed to clone EventSource request: {_0}")]
-	#[from]
-	EventSourceClone(reqwest_eventsource::CannotCloneRequestError),
+	#[display("Internal error: {_0}")]
+	Internal(String),
 
+	// -- Externals
 	#[display("JSON value extension error: {_0}")]
 	#[from]
 	JsonValueExt(JsonValueExtError),
-
-	#[display("Reqwest EventSource error: {_0}")]
-	ReqwestEventSource(Box<reqwest_eventsource::Error>),
 
 	#[display("Serde JSON error: {_0}")]
 	#[from]

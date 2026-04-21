@@ -1,29 +1,33 @@
 use crate::adapter::{AdapterDispatcher, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{ChatOptions, ChatOptionsSet, ChatRequest, ChatResponse, ChatStreamResponse};
+use crate::client::ModelSpec;
 use crate::embed::{EmbedOptions, EmbedOptionsSet, EmbedRequest, EmbedResponse};
 use crate::resolver::AuthData;
 use crate::{Client, Error, ModelIden, Result, ServiceTarget};
 
-/// Public AI Functions
+/// High-level client APIs.
 impl Client {
-	/// Returns all the model names for a given adapter kind.
-	///
-	/// IMPORTANT:
-	/// - Besides the Ollama adapter, this will only look at a hardcoded static list of names for now.
-	/// - For Ollama, it will currently make a live request to the default host/port (http://localhost:11434/v1/).
-	/// - This function will eventually change to either take an endpoint or have another function to allow a custom endpoint.
+	/// Lists model names for the given adapter.
 	///
 	/// Notes:
-	/// - Since genai only supports Chat for now, the adapter implementation should attempt to remove the non-chat models.
-	/// - Later, as genai adds more capabilities, we will have a `model_names(adapter_kind, Option<&[Skill]>)`
-	///   that will take a list of skills like (`ChatText`, `ChatImage`, `ChatFunction`, `TextToSpeech`, ...).
+	///
+	/// - Non-Ollama adapters use a static list.
+	///
+	/// - Ollama queries the default host (http://localhost:11434/v1/).
+	///
+	/// - May evolve to accept a custom endpoint.
+	///
+	/// - For most adapters, names also drive AdapterKind detection (see [`AdapterKind`]).
+	///
+	/// - Adapters should filter non-chat models until more skills are supported.
+	///   Future: `model_names(adapter_kind, Option<&[Skill]>)`.
 	pub async fn all_model_names(&self, adapter_kind: AdapterKind) -> Result<Vec<String>> {
-		let models = AdapterDispatcher::all_model_names(adapter_kind).await?;
+		let (auth, endpoint) = self.config().resolve_adapter_config(adapter_kind).await?;
+		let models = AdapterDispatcher::all_model_names(adapter_kind, endpoint, auth).await?;
 		Ok(models)
 	}
 
-	/// Return the default model for a model_name str.
-	/// This is used before
+	/// Builds a ModelIden by inferring AdapterKind from the model name.
 	pub fn default_model(&self, model_name: &str) -> Result<ModelIden> {
 		// -- First get the default ModelInfo
 		let adapter_kind = AdapterKind::from_model(model_name)?;
@@ -31,6 +35,7 @@ impl Client {
 		Ok(model_iden)
 	}
 
+	/// Deprecated: use `Client::resolve_service_target`.
 	#[deprecated(note = "use `client.resolve_service_target(model_name)`")]
 	pub async fn resolve_model_iden(&self, model_name: &str) -> Result<ModelIden> {
 		let model = self.default_model(model_name)?;
@@ -38,57 +43,104 @@ impl Client {
 		Ok(target.model)
 	}
 
-	pub async fn resolve_service_target(&self, model_name: &str) -> Result<ServiceTarget> {
-		let model = self.default_model(model_name)?;
-		self.config().resolve_service_target(model).await
+	/// Resolves the service target (endpoint, auth, and model) for the given model.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>`:
+	/// - `&str` or `String`: Model name with full inference
+	/// - `ModelIden`: Explicit adapter, resolves auth/endpoint
+	/// - `ServiceTarget`: Uses directly, bypasses model mapping and auth resolution
+	pub async fn resolve_service_target(&self, model: impl Into<ModelSpec>) -> Result<ServiceTarget> {
+		self.config().resolve_model_spec(model.into()).await
 	}
 
-	/// Executes a chat.
+	/// Sends a chat request and returns the full response.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>`:
+	/// - `&str` or `String`: Model name with full inference
+	/// - `ModelIden`: Explicit adapter, resolves auth/endpoint
+	/// - `ServiceTarget`: Uses directly, bypasses model mapping and auth resolution
 	pub async fn exec_chat(
 		&self,
-		model: &str,
+		model: impl Into<ModelSpec>,
 		chat_req: ChatRequest,
-		// options not implemented yet
 		options: Option<&ChatOptions>,
 	) -> Result<ChatResponse> {
 		let options_set = ChatOptionsSet::default()
 			.with_chat_options(options)
 			.with_client_options(self.config().chat_options());
 
-		let model = self.default_model(model)?;
-		let target = self.config().resolve_service_target(model).await?;
+		let target = self.config().resolve_model_spec(model.into()).await?;
 		let model = target.model.clone();
+		let auth_data = target.auth.clone();
 
-		let WebRequestData { headers, payload, url } =
-			AdapterDispatcher::to_web_request_data(target, ServiceType::Chat, chat_req, options_set.clone())?;
+		let WebRequestData {
+			mut url,
+			mut headers,
+			payload,
+		} = AdapterDispatcher::to_web_request_data(target, ServiceType::Chat, chat_req, options_set.clone())?;
 
-		let web_res =
-			self.web_client()
-				.do_post(&url, &headers, payload)
-				.await
-				.map_err(|webc_error| Error::WebModelCall {
-					model_iden: model.clone(),
-					webc_error,
-				})?;
+		if let Some(extra_headers) = options.and_then(|o| o.extra_headers.as_ref()) {
+			headers.merge_with(extra_headers);
+		}
 
-		let chat_res = AdapterDispatcher::to_chat_response(model, web_res, options_set)?;
+		if let AuthData::RequestOverride {
+			url: override_url,
+			headers: override_headers,
+		} = auth_data
+		{
+			url = override_url;
+			headers = override_headers;
+		};
 
-		Ok(chat_res)
+		let web_res = self
+			.web_client()
+			.do_post(&url, &headers, &payload)
+			.await
+			.map_err(|webc_error| Error::WebModelCall {
+				model_iden: model.clone(),
+				webc_error,
+			})?;
+
+		// Note: here we capture/clone the raw body if set in the options_set
+		let captured_raw_body = options_set.capture_raw_body().unwrap_or_default().then(|| web_res.body.clone());
+
+		match AdapterDispatcher::to_chat_response(model.clone(), web_res, options_set) {
+			Ok(mut chat_res) => {
+				chat_res.captured_raw_body = captured_raw_body;
+				Ok(chat_res)
+			}
+			Err(err) => {
+				let response_body = captured_raw_body.unwrap_or_else(|| {
+					"Raw response not captured. Use the ChatOptions.capturre_raw_body flag to see raw response in this error".into()
+				});
+				let err = Error::ChatResponseGeneration {
+					model_iden: model,
+					request_payload: Box::new(payload),
+					response_body: Box::new(response_body),
+					cause: err.to_string(),
+				};
+				Err(err)
+			}
+		}
 	}
 
-	/// Executes a chat stream response.
+	/// Streams a chat response.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>`:
+	/// - `&str` or `String`: Model name with full inference
+	/// - `ModelIden`: Explicit adapter, resolves auth/endpoint
+	/// - `ServiceTarget`: Uses directly, bypasses model mapping and auth resolution
 	pub async fn exec_chat_stream(
 		&self,
-		model: &str,
-		chat_req: ChatRequest, // options not implemented yet
+		model: impl Into<ModelSpec>,
+		chat_req: ChatRequest,
 		options: Option<&ChatOptions>,
 	) -> Result<ChatStreamResponse> {
 		let options_set = ChatOptionsSet::default()
 			.with_chat_options(options)
 			.with_client_options(self.config().chat_options());
 
-		let model = self.default_model(model)?;
-		let target = self.config().resolve_service_target(model).await?;
+		let target = self.config().resolve_model_spec(model.into()).await?;
 		let model = target.model.clone();
 		let auth_data = target.auth.clone();
 
@@ -97,6 +149,10 @@ impl Client {
 			mut headers,
 			payload,
 		} = AdapterDispatcher::to_web_request_data(target, ServiceType::ChatStream, chat_req, options_set.clone())?;
+
+		if let Some(extra_headers) = options.and_then(|o| o.extra_headers.as_ref()) {
+			headers.merge_with(extra_headers);
+		}
 
 		// TODO: Need to check this.
 		//       This was part of the 429c5cee2241dbef9f33699b9c91202233c22816 commit
@@ -112,7 +168,7 @@ impl Client {
 
 		let reqwest_builder = self
 			.web_client()
-			.new_req_builder(&url, &headers, payload)
+			.new_req_builder(&url, &headers, &payload)
 			.map_err(|webc_error| Error::WebModelCall {
 				model_iden: model.clone(),
 				webc_error,
@@ -123,10 +179,12 @@ impl Client {
 		Ok(res)
 	}
 
-	/// Executes an embedding request for a single text input.
+	/// Creates embeddings for a single input string.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>` for the model parameter.
 	pub async fn embed(
 		&self,
-		model: &str,
+		model: impl Into<ModelSpec>,
 		input: impl Into<String>,
 		options: Option<&EmbedOptions>,
 	) -> Result<EmbedResponse> {
@@ -134,10 +192,12 @@ impl Client {
 		self.exec_embed(model, embed_req, options).await
 	}
 
-	/// Executes an embedding request for multiple text inputs (batch operation).
+	/// Creates embeddings for multiple input strings.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>` for the model parameter.
 	pub async fn embed_batch(
 		&self,
-		model: &str,
+		model: impl Into<ModelSpec>,
 		inputs: Vec<String>,
 		options: Option<&EmbedOptions>,
 	) -> Result<EmbedResponse> {
@@ -145,10 +205,15 @@ impl Client {
 		self.exec_embed(model, embed_req, options).await
 	}
 
-	/// Executes an embedding request.
+	/// Sends an embedding request and returns the response.
+	///
+	/// Accepts any type that implements `Into<ModelSpec>`:
+	/// - `&str` or `String`: Model name with full inference
+	/// - `ModelIden`: Explicit adapter, resolves auth/endpoint
+	/// - `ServiceTarget`: Uses directly, bypasses model mapping and auth resolution
 	pub async fn exec_embed(
 		&self,
-		model: &str,
+		model: impl Into<ModelSpec>,
 		embed_req: EmbedRequest,
 		options: Option<&EmbedOptions>,
 	) -> Result<EmbedResponse> {
@@ -156,21 +221,20 @@ impl Client {
 			.with_request_options(options)
 			.with_client_options(self.config().embed_options());
 
-		let model = self.default_model(model)?;
-		let target = self.config().resolve_service_target(model).await?;
+		let target = self.config().resolve_model_spec(model.into()).await?;
 		let model = target.model.clone();
 
 		let WebRequestData { headers, payload, url } =
 			AdapterDispatcher::to_embed_request_data(target, embed_req, options_set.clone())?;
 
-		let web_res =
-			self.web_client()
-				.do_post(&url, &headers, payload)
-				.await
-				.map_err(|webc_error| Error::WebModelCall {
-					model_iden: model.clone(),
-					webc_error,
-				})?;
+		let web_res = self
+			.web_client()
+			.do_post(&url, &headers, &payload)
+			.await
+			.map_err(|webc_error| Error::WebModelCall {
+				model_iden: model.clone(),
+				webc_error,
+			})?;
 
 		let res = AdapterDispatcher::to_embed_response(model, web_res, options_set)?;
 

@@ -2,7 +2,8 @@ use crate::adapter::adapters::support::get_api_key;
 use crate::adapter::cohere::CohereStreamer;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
-	ChatOptionsSet, ChatRequest, ChatResponse, ChatRole, ChatStream, ChatStreamResponse, MessageContent, Usage,
+	ChatOptionsSet, ChatRequest, ChatResponse, ChatRole, ChatStream, ChatStreamResponse, MessageContent, StopReason,
+	Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{WebResponse, WebStream};
@@ -28,30 +29,36 @@ impl CohereAdapter {
 }
 
 impl Adapter for CohereAdapter {
+	const DEFAULT_API_KEY_ENV_NAME: Option<&'static str> = Some(Self::API_KEY_DEFAULT_ENV_NAME);
+
 	fn default_endpoint() -> Endpoint {
 		const BASE_URL: &str = "https://api.cohere.com/v1/";
 		Endpoint::from_static(BASE_URL)
 	}
 
 	fn default_auth() -> AuthData {
-		AuthData::from_env(Self::API_KEY_DEFAULT_ENV_NAME)
+		match Self::DEFAULT_API_KEY_ENV_NAME {
+			Some(env_name) => AuthData::from_env(env_name),
+			None => AuthData::None,
+		}
 	}
 
 	/// Note: For now, it returns the common ones (see above)
-	async fn all_model_names(_kind: AdapterKind) -> Result<Vec<String>> {
+	async fn all_model_names(_kind: AdapterKind, _endpoint: Endpoint, _auth: AuthData) -> Result<Vec<String>> {
 		Ok(MODELS.iter().map(|s| s.to_string()).collect())
 	}
 
-	fn get_service_url(_model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> String {
+	fn get_service_url(_model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> Result<String> {
 		let base_url = endpoint.base_url();
-		match service_type {
+		let url = match service_type {
 			ServiceType::Chat | ServiceType::ChatStream => format!("{base_url}chat"),
 			ServiceType::Embed => {
 				//HACK: Cohere embeddings use v2 API, but base_url is v1, so we need to replace it
 				let base_without_version = base_url.trim_end_matches("v1/");
 				format!("{base_without_version}v2/embed")
 			}
-		}
+		};
+		Ok(url)
 	}
 
 	fn to_web_request_data(
@@ -66,7 +73,7 @@ impl Adapter for CohereAdapter {
 		let api_key = get_api_key(auth, &model)?;
 
 		// -- url
-		let url = Self::get_service_url(&model, service_type, endpoint);
+		let url = Self::get_service_url(&model, service_type, endpoint)?;
 
 		// -- headers
 		let headers = Headers::from(("Authorization".to_string(), format!("Bearer {api_key}")));
@@ -79,7 +86,7 @@ impl Adapter for CohereAdapter {
 		} = Self::into_cohere_request_parts(model.clone(), chat_req)?;
 
 		// -- Build the basic payload
-		let (model_name, _) = model.model_name.as_model_name_and_namespace();
+		let (_, model_name) = model.model_name.namespace_and_name();
 		let stream = matches!(service_type, ServiceType::ChatStream);
 		let mut payload = json!({
 			"model": model_name.to_string(),
@@ -117,16 +124,22 @@ impl Adapter for CohereAdapter {
 	fn to_chat_response(
 		model_iden: ModelIden,
 		web_response: WebResponse,
-		options_set: ChatOptionsSet<'_, '_>,
+		_options_set: ChatOptionsSet<'_, '_>,
 	) -> Result<ChatResponse> {
 		let WebResponse { mut body, .. } = web_response;
-		let captured_raw_body = options_set.capture_raw_body().unwrap_or_default().then(|| body.clone());
 
 		// -- Capture the provider_model_iden
 		// TODO: Need to be implemented (if available), for now, just clone model_iden
 		// let provider_model_name: Option<String> = body.x_remove("model").ok();
 		let provider_model_name = None;
 		let provider_model_iden = model_iden.from_optional_name(provider_model_name);
+
+		// -- Get stop_reason
+		let stop_reason = body
+			.x_take::<Option<String>>("finish_reason")
+			.ok()
+			.flatten()
+			.map(StopReason::from);
 
 		// -- Get usage
 		let usage = body.x_take("/meta/tokens").map(Self::into_usage).unwrap_or_default();
@@ -136,9 +149,9 @@ impl Adapter for CohereAdapter {
 			return Err(Error::NoChatResponse { model_iden });
 		};
 
-		let content: Vec<MessageContent> = last_chat_history_item
+		let content: MessageContent = last_chat_history_item
 			.x_take::<Option<String>>("message")?
-			.map(|c| vec![MessageContent::from(c)])
+			.map(MessageContent::from)
 			.unwrap_or_default();
 
 		Ok(ChatResponse {
@@ -146,8 +159,10 @@ impl Adapter for CohereAdapter {
 			reasoning_content: None,
 			model_iden,
 			provider_model_iden,
+			stop_reason,
 			usage,
-			captured_raw_body,
+			captured_raw_body: None, // Set by the client exec_chat
+			response_id: None,
 		})
 	}
 
@@ -248,7 +263,7 @@ impl CohereAdapter {
 		}
 
 		// TODO: Needs to implement tool_calls
-		let MessageContent::Text(message) = last_chat_msg.content else {
+		let Some(message) = last_chat_msg.content.into_joined_texts() else {
 			return Err(Error::MessageContentTypeNotSupported {
 				model_iden,
 				cause: "Only MessageContent::Text supported for this model (for now)",
@@ -257,7 +272,7 @@ impl CohereAdapter {
 
 		// -- Build
 		for msg in chat_req.messages {
-			let MessageContent::Text(content) = msg.content else {
+			let Some(content) = msg.content.into_joined_texts() else {
 				return Err(Error::MessageContentTypeNotSupported {
 					model_iden,
 					cause: "Only MessageContent::Text supported for this model (for now)",

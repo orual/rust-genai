@@ -1,10 +1,10 @@
-use crate::adapter::adapters::support::get_api_key;
+use crate::adapter::adapters::support::{content_as_string, get_api_key};
 use crate::adapter::gemini::GeminiStreamer;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
-	ChatOptionsSet, ChatRequest, ChatResponse, ChatResponseFormat, ChatRole, ChatStream, ChatStreamResponse,
-	CompletionTokensDetails, ContentBlock, ContentPart, ImageSource, MessageContent, PromptTokensDetails,
-	ReasoningEffort, ToolCall, Usage,
+	Binary, BinarySource, ChatOptionsSet, ChatRequest, ChatResponse, ChatResponseFormat, ChatRole, ChatStream,
+	ChatStreamResponse, CompletionTokensDetails, ContentPart, MessageContent, PromptTokensDetails, ReasoningEffort,
+	StopReason, ThinkingBlock, Tool, ToolCall, ToolConfig, ToolName, Usage,
 };
 use crate::resolver::{AuthData, Endpoint};
 use crate::webc::{WebResponse, WebStream};
@@ -15,19 +15,30 @@ use value_ext::JsonValueExt;
 
 pub struct GeminiAdapter;
 
-// Note: Those model names are just informative, as the Gemini AdapterKind is selected on `startsWith("gemini")`
-const MODELS: &[&str] = &[
-	"gemini-2.5-pro",
-	"gemini-2.5-flash",
-	"gemini-2.5-flash-lite-preview-06-17",
-	"gemini-2.0-flash-lite",
-];
-
 // Per gemini doc (https://x.com/jeremychone/status/1916501987371438372)
-const REASONING_ZERO: u32 = 0;
-const REASONING_LOW: u32 = 1000;
-const REASONING_MEDIUM: u32 = 8000;
-const REASONING_HIGH: u32 = 24000;
+pub(in crate::adapter) const REASONING_ZERO: u32 = 0;
+pub(in crate::adapter) const REASONING_LOW: u32 = 1000;
+pub(in crate::adapter) const REASONING_MEDIUM: u32 = 8000;
+pub(in crate::adapter) const REASONING_HIGH: u32 = 24000;
+
+/// Important
+/// - For now Low and Minimal aare the same for geminia
+/// -
+fn insert_gemini_thinking_budget_value(payload: &mut Value, effort: &ReasoningEffort) -> Result<()> {
+	// -- for now, match minimal to Low (because zero is not supported by 2.5 pro)
+	let budget = match effort {
+		ReasoningEffort::None => None,
+		ReasoningEffort::Low | ReasoningEffort::Minimal => Some(REASONING_LOW),
+		ReasoningEffort::Medium => Some(REASONING_MEDIUM),
+		ReasoningEffort::High | ReasoningEffort::Max | ReasoningEffort::XHigh => Some(REASONING_HIGH),
+		ReasoningEffort::Budget(budget) => Some(*budget),
+	};
+
+	if let Some(budget) = budget {
+		payload.x_insert("/generationConfig/thinkingConfig/thinkingBudget", budget)?;
+	}
+	Ok(())
+}
 
 // curl \
 //   -H 'Content-Type: application/json' \
@@ -39,30 +50,64 @@ impl GeminiAdapter {
 }
 
 impl Adapter for GeminiAdapter {
+	const DEFAULT_API_KEY_ENV_NAME: Option<&'static str> = Some(Self::API_KEY_DEFAULT_ENV_NAME);
+
 	fn default_endpoint() -> Endpoint {
 		const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta/";
 		Endpoint::from_static(BASE_URL)
 	}
 
 	fn default_auth() -> AuthData {
-		AuthData::from_env(Self::API_KEY_DEFAULT_ENV_NAME)
+		match Self::DEFAULT_API_KEY_ENV_NAME {
+			Some(env_name) => AuthData::from_env(env_name),
+			None => AuthData::None,
+		}
 	}
 
-	/// Note: For now, this returns the common models (see above)
-	async fn all_model_names(_kind: AdapterKind) -> Result<Vec<String>> {
-		Ok(MODELS.iter().map(|s| s.to_string()).collect())
+	async fn all_model_names(kind: AdapterKind, endpoint: Endpoint, auth: AuthData) -> Result<Vec<String>> {
+		// -- url
+		let base_url = endpoint.base_url();
+		let url = format!("{base_url}models");
+
+		// -- auth / headers
+		let api_key = auth.single_key_value().ok();
+		let headers = api_key
+			.map(|api_key| Headers::from(("x-goog-api-key".to_string(), api_key)))
+			.unwrap_or_default();
+
+		// -- Exec request
+		let web_c = crate::webc::WebClient::default();
+		let mut res = web_c.do_get(&url, &headers).await.map_err(|webc_error| Error::WebAdapterCall {
+			adapter_kind: kind,
+			webc_error,
+		})?;
+
+		// -- Format result
+		let mut models: Vec<String> = Vec::new();
+
+		if let Value::Array(models_value) = res.body.x_take("models")? {
+			for mut model in models_value {
+				let model_name: String = model.x_take("name")?;
+				// Gemini model names are usually prefixed with "models/"
+				let model_name = model_name.strip_prefix("models/").unwrap_or(&model_name).to_string();
+				models.push(model_name);
+			}
+		}
+
+		Ok(models)
 	}
 
 	/// NOTE: As Google Gemini has decided to put their API_KEY in the URL,
 	///       this will return the URL without the API_KEY in it. The API_KEY will need to be added by the caller.
-	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> String {
+	fn get_service_url(model: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> Result<String> {
 		let base_url = endpoint.base_url();
-		let (model_name, _) = model.model_name.as_model_name_and_namespace();
-		match service_type {
+		let (_, model_name) = model.model_name.namespace_and_name();
+		let url = match service_type {
 			ServiceType::Chat => format!("{base_url}models/{model_name}:generateContent"),
 			ServiceType::ChatStream => format!("{base_url}models/{model_name}:streamGenerateContent"),
 			ServiceType::Embed => format!("{base_url}models/{model_name}:embedContent"), // Gemini embeddings API
-		}
+		};
+		Ok(url)
 	}
 
 	fn to_web_request_data(
@@ -72,119 +117,18 @@ impl Adapter for GeminiAdapter {
 		options_set: ChatOptionsSet<'_, '_>,
 	) -> Result<WebRequestData> {
 		let ServiceTarget { endpoint, auth, model } = target;
-		let (model_name, _) = model.model_name.as_model_name_and_namespace();
+		let (_, model_name) = model.model_name.namespace_and_name();
 
 		// -- api_key
 		let api_key = get_api_key(auth, &model)?;
-
-		// -- headers (empty for gemini)
 		let headers = Headers::from(("x-goog-api-key".to_string(), api_key.to_string()));
 
-		// -- Reasoning Budget
-		let (provider_model_name, reasoning_effort) = match (model_name, options_set.reasoning_effort()) {
-			// No explicity reasoning_effor, try to infer from model name suffix (supports -zero)
-			(model, None) => {
-				// let model_name: &str = &model.model_name;
-				if let Some((prefix, last)) = model_name.rsplit_once('-') {
-					let reasoning = match last {
-						"zero" => Some(ReasoningEffort::Budget(REASONING_ZERO)),
-						"low" => Some(ReasoningEffort::Budget(REASONING_LOW)),
-						"medium" => Some(ReasoningEffort::Budget(REASONING_MEDIUM)),
-						"high" => Some(ReasoningEffort::Budget(REASONING_HIGH)),
-						_ => None,
-					};
-					// create the model name if there was a `-..` reasoning suffix
-					let model = if reasoning.is_some() { prefix } else { model };
-
-					(model, reasoning)
-				} else {
-					(model, None)
-				}
-			}
-			// If reasoning effort, turn the low, medium, budget ones into Budget
-			(model, Some(effort)) => {
-				let effort = match effort {
-					ReasoningEffort::Low => ReasoningEffort::Budget(REASONING_LOW),
-					ReasoningEffort::Medium => ReasoningEffort::Budget(REASONING_MEDIUM),
-					ReasoningEffort::High => ReasoningEffort::Budget(REASONING_HIGH),
-					ReasoningEffort::Budget(budget) => ReasoningEffort::Budget(*budget),
-				};
-				(model, Some(effort))
-			}
-		};
-
-		// -- parts
-		let GeminiChatRequestParts {
-			system,
-			contents,
-			tools,
-		} = Self::into_gemini_request_parts(&model, chat_req)?;
-
-		// -- Playload
-		let mut payload = json!({
-			"contents": contents,
-		});
-
-		// -- Set the reasoning effort
-		if let Some(ReasoningEffort::Budget(budget)) = reasoning_effort {
-			payload.x_insert("/generationConfig/thinkingConfig/thinkingBudget", budget)?;
-			// Include thoughts in the response when thinking is enabled
-			payload.x_insert("/generationConfig/thinkingConfig/includeThoughts", true)?;
-		}
-
-		// Note: It's unclear from the spec if the content of systemInstruction should have a role.
-		//       Right now, it is omitted (since the spec states it can only be "user" or "model")
-		//       It seems to work. https://ai.google.dev/api/rest/v1beta/models/generateContent
-		if let Some(system) = system {
-			payload.x_insert(
-				"systemInstruction",
-				json!({
-					"parts": [ { "text": system }]
-				}),
-			)?;
-		}
-
-		// -- Tools
-		if let Some(tools) = tools {
-			payload.x_insert("tools", tools)?;
-		}
-
-		// -- Response Format
-		if let Some(ChatResponseFormat::JsonSpec(st_json)) = options_set.response_format() {
-			// x_insert
-			//     responseMimeType: "application/json",
-			// responseSchema: {
-			payload.x_insert("/generationConfig/responseMimeType", "application/json")?;
-			let mut schema = st_json.schema.clone();
-			schema.x_walk(|parent_map, name| {
-				if name == "additionalProperties" {
-					parent_map.remove("additionalProperties");
-				}
-				true
-			});
-			payload.x_insert("/generationConfig/responseSchema", schema)?;
-		}
-
-		// -- Add supported ChatOptions
-		if let Some(temperature) = options_set.temperature() {
-			payload.x_insert("/generationConfig/temperature", temperature)?;
-		}
-
-		if !options_set.stop_sequences().is_empty() {
-			payload.x_insert("/generationConfig/stopSequences", options_set.stop_sequences())?;
-		}
-
-		if let Some(max_tokens) = options_set.max_tokens() {
-			payload.x_insert("/generationConfig/maxOutputTokens", max_tokens)?;
-		}
-		if let Some(top_p) = options_set.top_p() {
-			payload.x_insert("/generationConfig/topP", top_p)?;
-		}
+		let (payload, provider_model_name) =
+			Self::build_gemini_request_payload(&model, model_name, chat_req, options_set)?;
 
 		// -- url
-		let provider_model = model.from_name(provider_model_name);
-		let url = Self::get_service_url(&provider_model, service_type, endpoint);
-		let url = url.to_string();
+		let provider_model = model.from_name(&provider_model_name);
+		let url = Self::get_service_url(&provider_model, service_type, endpoint)?;
 
 		Ok(WebRequestData { url, headers, payload })
 	}
@@ -192,11 +136,9 @@ impl Adapter for GeminiAdapter {
 	fn to_chat_response(
 		model_iden: ModelIden,
 		web_response: WebResponse,
-		options_set: ChatOptionsSet<'_, '_>,
+		_options_set: ChatOptionsSet<'_, '_>,
 	) -> Result<ChatResponse> {
 		let WebResponse { mut body, .. } = web_response;
-
-		let captured_raw_body = options_set.capture_raw_body().unwrap_or_default().then(|| body.clone());
 
 		// -- Capture the provider_model_iden
 		// TODO: Need to be implemented (if available), for now, just clone model_iden
@@ -206,81 +148,128 @@ impl Adapter for GeminiAdapter {
 		let GeminiChatResponse {
 			content: gemini_content,
 			usage,
+			stop_reason,
 		} = gemini_response;
+		let stop_reason = stop_reason.map(StopReason::from);
 
-		// Check if we have thinking blocks
-		let has_thinking = gemini_content
-			.iter()
-			.any(|item| matches!(item, GeminiChatContent::Thinking { .. }));
+		let mut reasonings: Vec<String> = Vec::new();
+		let mut texts: Vec<String> = Vec::new();
+		let mut tool_calls: Vec<ToolCall> = Vec::new();
+		let mut binary_parts: Vec<Binary> = Vec::new();
+		// All signatures seen in wire order, used to build ThinkingBlock content parts.
+		let mut all_signatures: Vec<String> = Vec::new();
 
-		if has_thinking {
-			// When we have thinking blocks, preserve them as blocks
-			let mut blocks: Vec<ContentBlock> = Vec::new();
-			let mut reasoning_content = String::new();
-
-			for g_item in gemini_content {
-				match g_item {
-					GeminiChatContent::Text(text) => {
-						blocks.push(ContentBlock::Text {
-							text,
-							thought_signature: None,
-						});
-					}
-					GeminiChatContent::Thinking { text, signature } => {
-						reasoning_content.push_str(&text);
-						reasoning_content.push('\n');
-						blocks.push(ContentBlock::Thinking { text, signature });
-					}
-					GeminiChatContent::ToolCall(tool_call) => {
-						blocks.push(ContentBlock::ToolUse {
-							id: tool_call.call_id.clone(),
-							name: tool_call.fn_name,
-							input: tool_call.fn_arguments,
-							thought_signature: None,
-						});
-					}
-				}
-			}
-
-			Ok(ChatResponse {
-				content: vec![MessageContent::Blocks(blocks)],
-				reasoning_content: if reasoning_content.is_empty() {
-					None
-				} else {
-					Some(reasoning_content)
-				},
-				model_iden,
-				provider_model_iden,
-				usage,
-				captured_raw_body,
-			})
-		} else {
-			// No thinking blocks, use simple format
-			let mut tool_calls: Vec<ToolCall> = Default::default();
-			let mut content: Vec<MessageContent> = Default::default();
-
-			for g_item in gemini_content {
-				match g_item {
-					GeminiChatContent::Text(text) => content.push(MessageContent::from_text(text)),
-					GeminiChatContent::ToolCall(tool_call) => tool_calls.push(tool_call),
-					GeminiChatContent::Thinking { .. } => {
-						// Should not happen if has_thinking is false
+		// Walk content in wire order to pair each thoughtSignature with the
+		// functionCall that immediately follows it.
+		//
+		// Wire format: body_to_gemini_chat_response processes each response part and,
+		// when a part contains both a thoughtSignature and a functionCall, it pushes
+		// GeminiChatContent::ThoughtSignature immediately before GeminiChatContent::ToolCall.
+		// This means the signature always precedes its associated tool call in gemini_content.
+		//
+		// Edge cases:
+		// - Consecutive signatures (no intervening tool call): the orphaned first signature
+		//   is attached to the most recent tool call (if any) with a warning, then dropped.
+		// - Trailing signature (no following tool call): attached to the last tool call
+		//   (if any) with a warning, then dropped.
+		// - More tool calls than signatures: later tool calls get no signature.
+		let mut pending_signature: Option<String> = None;
+		for g_item in gemini_content {
+			match g_item {
+				GeminiChatContent::Text(text) => texts.push(text),
+				GeminiChatContent::Binary(binary) => binary_parts.push(binary),
+				GeminiChatContent::Reasoning(reasoning_text) => reasonings.push(reasoning_text),
+				GeminiChatContent::ThoughtSignature(sig) => {
+					// Record this signature for the ThinkingBlock content parts regardless.
+					all_signatures.push(sig.clone());
+					if let Some(prev) = pending_signature.replace(sig) {
+						// Two signatures in a row with no intervening tool call.
+						// This is unexpected per the Gemini 3 spec. Attach the orphaned
+						// first signature to the last tool call seen (if any).
+						if let Some(last_call) = tool_calls.last_mut() {
+							tracing::warn!(
+								"gemini inbound: unexpected consecutive thoughtSignatures; \
+								 attaching orphaned signature to last tool call '{}'",
+								last_call.fn_name
+							);
+							last_call.thought_signatures.get_or_insert_with(Vec::new).push(prev);
+						} else {
+							tracing::warn!(
+								"gemini inbound: orphaned thoughtSignature (no tool call to attach to); dropping"
+							);
+						}
 					}
 				}
+				GeminiChatContent::ToolCall(mut tool_call) => {
+					if let Some(sig) = pending_signature.take() {
+						// Pair this signature with its associated tool call.
+						tool_call.thought_signatures = Some(vec![sig]);
+						tool_call.thought_signatures_provenance = Some(AdapterKind::Gemini);
+					}
+					tool_calls.push(tool_call);
+				}
 			}
-			if !tool_calls.is_empty() {
-				content.push(MessageContent::ToolCalls(tool_calls))
-			}
-
-			Ok(ChatResponse {
-				content,
-				reasoning_content: None,
-				model_iden,
-				provider_model_iden,
-				usage,
-				captured_raw_body,
-			})
 		}
+
+		// Any signature still pending had no following tool call. Attach to last call
+		// if possible, otherwise drop.
+		if let Some(leftover) = pending_signature {
+			if let Some(last_call) = tool_calls.last_mut() {
+				tracing::warn!(
+					"gemini inbound: trailing thoughtSignature with no following tool call; \
+					 attaching to last tool call '{}'",
+					last_call.fn_name
+				);
+				last_call.thought_signatures.get_or_insert_with(Vec::new).push(leftover);
+			} else {
+				tracing::warn!("gemini inbound: trailing thoughtSignature with no tool calls; dropping");
+			}
+		}
+
+		// Build ThinkingBlock content parts from all collected signatures (in order).
+		// These sit alongside the ToolCall parts in the final message content so that
+		// callers have the full thinking context as well as the per-call assignment.
+		let mut parts: Vec<ContentPart> = all_signatures
+			.into_iter()
+			.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Gemini, "", sig)))
+			.collect();
+
+		if !texts.is_empty() {
+			let total_len: usize = texts.iter().map(|t| t.len()).sum();
+			let mut combined_text = String::with_capacity(total_len);
+			for text in texts {
+				combined_text.push_str(&text);
+			}
+			if !combined_text.is_empty() {
+				parts.push(ContentPart::Text(combined_text));
+			}
+		}
+		let mut reasoning_text = String::new();
+		if !reasonings.is_empty() {
+			for reasoning in &reasonings {
+				reasoning_text.push_str(reasoning);
+			}
+		}
+
+		if !binary_parts.is_empty() {
+			for binary in binary_parts {
+				parts.push(ContentPart::Binary(binary));
+			}
+		}
+
+		parts.extend(tool_calls.into_iter().map(ContentPart::ToolCall));
+		let content = MessageContent::from_parts(parts);
+
+		Ok(ChatResponse {
+			content,
+			reasoning_content: Some(reasoning_text),
+			model_iden,
+			provider_model_iden,
+			stop_reason,
+			usage,
+			captured_raw_body: None, // Set by the client exec_chat
+			response_id: None,
+		})
 	}
 
 	fn to_chat_stream(
@@ -320,10 +309,13 @@ impl Adapter for GeminiAdapter {
 
 /// Support functions for GeminiAdapter
 impl GeminiAdapter {
-	pub(super) fn body_to_gemini_chat_response(model_iden: &ModelIden, mut body: Value) -> Result<GeminiChatResponse> {
+	pub(in crate::adapter) fn body_to_gemini_chat_response(
+		model_iden: &ModelIden,
+		mut body: Value,
+	) -> Result<GeminiChatResponse> {
 		// If the body has an `error` property, then it is assumed to be an error.
 		if body.get("error").is_some() {
-			return Err(Error::StreamEventError {
+			return Err(Error::ChatResponse {
 				model_iden: model_iden.clone(),
 				body,
 			});
@@ -331,81 +323,216 @@ impl GeminiAdapter {
 
 		let mut content: Vec<GeminiChatContent> = Vec::new();
 
+		// Extract usage before content/parts so it is available even in
+		// usage-only tail frames (finishReason + usageMetadata but no content).
+		let usage = body.x_take::<Value>("usageMetadata").map(Self::into_usage).unwrap_or_default();
+
 		// -- Read multipart
-		// // Check if the expected path exists before trying to extract
-		// if body.get("candidates").is_none() || body.get("candidates").and_then(|c| c.get(0)).is_none() {
-		// 	// Check for specific reasons why candidates might be empty
-		// 	if let Some(prompt_feedback) = body.get("promptFeedback") {
-		// 		eprintln!(
-		// 			"Gemini API blocked prompt with feedback: {}",
-		// 			serde_json::to_string_pretty(prompt_feedback).unwrap_or_else(|_| prompt_feedback.to_string())
-		// 		);
-		// 	}
+		let parts = match body.x_take::<Vec<Value>>("/candidates/0/content/parts") {
+			Ok(parts) => parts,
+			Err(_) => {
+				let finish_reason = body
+					.x_remove::<String>("/candidates/0/finishReason")
+					.ok()
+					.or_else(|| body.x_remove::<String>("/candidates/finishReason").ok());
+				let saw_usage_only_tail = body.get("candidates").is_some() || finish_reason.is_some();
 
-		// 	// Check if candidates exists but is empty array vs missing entirely
-		// 	if let Some(candidates) = body.get("candidates") {
-		// 		if candidates.is_array() && candidates.as_array().map_or(false, |a| a.is_empty()) {
-		// 			eprintln!("Gemini API returned empty candidates array - likely safety filtered or prompt blocked");
-		// 		}
-		// 	} else {
-		// 		// This is the problematic case - no candidates at all, just usageMetadata
-		// 		// This is a known Gemini 2.5 Pro issue
-		// 		eprintln!(
-		// 			"Gemini API response missing candidates entirely (known issue with Gemini 2.5). Response: {}",
-		// 			serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string())
-		// 		);
-		// 	}
+				// Gemini streaming sends a final frame with finishReason + usageMetadata
+				// but no content.parts. This is normal — return Ok with empty content.
+				if saw_usage_only_tail {
+					return Ok(GeminiChatResponse {
+						content,
+						usage,
+						stop_reason: finish_reason,
+					});
+				}
 
-		// 	// Return empty response - caller should handle this as a failed generation
-		// 	let usage = body.x_take::<Value>("usageMetadata").map(Self::into_usage).unwrap_or_default();
-		// 	return Ok(GeminiChatResponse { content, usage });
-		// }
+				let body = json!({
+					"finishReason": finish_reason,
+					"usageMetadata": Value::Null,
+				});
+				return Err(Error::ChatResponse {
+					model_iden: model_iden.clone(),
+					body,
+				});
+			}
+		};
 
-		let parts = body.x_take::<Vec<Value>>("/candidates/0/content/parts")?;
+		let mut tool_call_counter: usize = 0;
 		for mut part in parts {
-			// Check if this part has a thought signature (can be on any part)
-			let thought_signature = part
-				.x_take::<String>("thoughtSignature")
-				.ok()
-				.map(|sig| format!("gemini:{}", sig)); // Prefix with vendor
+			// Each Gemini response part may contain one or more of:
+			// thoughtSignature, thought+text (reasoning), functionCall, text.
+			// We extract them in priority order.
 
-			// Check if this is a thought part
-			let is_thought = part.x_get::<bool>("thought").unwrap_or(false);
-
-			// -- Capture eventual function call
-			if let Ok(fn_call_value) = part.x_take::<Value>("functionCall") {
-				let tool_call = ToolCall {
-					// NOTE: Gemini does not have call_id so, use name
-					call_id: fn_call_value.x_get("name").unwrap_or("".to_string()), // TODO: Handle this, gemini does not return the call_id
-					fn_name: fn_call_value.x_get("name").unwrap_or("".to_string()),
-					fn_arguments: fn_call_value.x_get("args").unwrap_or(Value::Null),
-				};
-				content.push(GeminiChatContent::ToolCall(tool_call))
+			// -- Thought signature (Gemini 3+) or legacy thought boolean
+			if let Some(sig) = take_string(&mut part, "thoughtSignature") {
+				// Gemini 3+ provides a per-part opaque signature. Store it in the
+				// GeminiChatContent enum so it can later be converted to a ThinkingBlock
+				// with Gemini provenance.
+				content.push(GeminiChatContent::ThoughtSignature(sig));
+			} else if take_bool(&mut part, "thought") {
+				// Legacy: `thought: true` + `text` = reasoning content
+				if let Some(reasoning) = take_string(&mut part, "text") {
+					content.push(GeminiChatContent::Reasoning(reasoning));
+				}
 			}
 
-			// -- Capture eventual text (including thoughts)
-			if let Some(text) = part
-				.x_take::<Value>("text")
-				.ok()
-				.and_then(|v| if let Value::String(v) = v { Some(v) } else { None })
-			{
-				if is_thought {
-					content.push(GeminiChatContent::Thinking {
-						text,
-						signature: thought_signature,
-					})
-				} else {
-					content.push(GeminiChatContent::Text(text))
+			// -- Function call
+			if let Ok(fc) = part.x_take::<Value>("functionCall") {
+				let fn_name: String = fc.x_get("name").unwrap_or_default();
+				// Gemini omits call_id; synthesize a unique one to avoid
+				// collisions when the same tool is called multiple times.
+				let call_id = format!("call#{}#{}", fn_name, tool_call_counter);
+				tool_call_counter += 1;
+				content.push(GeminiChatContent::ToolCall(ToolCall {
+					call_id,
+					fn_name,
+					fn_arguments: fc.x_get("args").unwrap_or(Value::Null),
+					thought_signatures: None,
+					thought_signatures_provenance: None,
+				}));
+			}
+
+			// -- Plain text
+			if let Some(text) = take_string(&mut part, "text") {
+				content.push(GeminiChatContent::Text(text));
+			}
+
+			// -- Capture eventual inlineData (Image)
+			if let Ok(inline_data) = part.x_take::<Value>("inlineData") {
+				// Note: Gemini may send inline data in multiple parts, but for now, we will treat each part as a separate binary content. We can consider concatenating them if needed in the future.
+				if let Ok(mime_type) = inline_data.x_get::<String>("mimeType")
+					&& let Ok(data) = inline_data.x_get::<String>("data")
+				{
+					let binary = Binary::from_base64(mime_type, data, None);
+					content.push(GeminiChatContent::Binary(binary));
 				}
 			}
 		}
-		let usage = body.x_take::<Value>("usageMetadata").map(Self::into_usage).unwrap_or_default();
+		let stop_reason: Option<String> = body.x_take("/candidates/0/finishReason").ok();
 
-		Ok(GeminiChatResponse { content, usage })
+		Ok(GeminiChatResponse {
+			content,
+			usage,
+			stop_reason,
+		})
+	}
+
+	/// Builds the Gemini JSON payload from a ChatRequest, including reasoning budget
+	/// resolution, system instruction, tools, response format, and chat options.
+	/// Returns (payload, provider_model_name) where provider_model_name may differ
+	/// from model_name if a reasoning suffix was stripped.
+	pub(in crate::adapter) fn build_gemini_request_payload(
+		model: &ModelIden,
+		model_name: &str,
+		chat_req: ChatRequest,
+		options_set: ChatOptionsSet<'_, '_>,
+	) -> Result<(Value, String)> {
+		// -- Reasoning Budget
+		let (provider_model_name, computed_reasoning_effort) = match (model_name, options_set.reasoning_effort()) {
+			// No explicit reasoning_effort, try to infer from model name suffix (supports -zero)
+			(model, None) => {
+				if let Some((prefix, last)) = model_name.rsplit_once('-') {
+					let reasoning = match last {
+						// 'zero' is a gemini special
+						"zero" => Some(ReasoningEffort::Budget(REASONING_ZERO)),
+						"none" => Some(ReasoningEffort::None),
+						"low" | "minimal" => Some(ReasoningEffort::Low),
+						"medium" => Some(ReasoningEffort::Medium),
+						"high" => Some(ReasoningEffort::High),
+						"xhigh" => Some(ReasoningEffort::XHigh),
+						"max" => Some(ReasoningEffort::Max),
+						_ => None,
+					};
+					// strip the reasoning suffix from the model name if one was matched
+					let model = if reasoning.is_some() { prefix } else { model };
+					(model, reasoning)
+				} else {
+					(model, None)
+				}
+			}
+			// TOOD: make it more elegant
+			(model, Some(effort)) => (model, Some(effort.clone())),
+		};
+
+		// -- parts
+		let GeminiChatRequestParts {
+			system,
+			contents,
+			tools,
+		} = Self::into_gemini_request_parts(model, chat_req)?;
+
+		let mut payload = json!({ "contents": contents });
+
+		// -- Set the reasoning effort
+		if let Some(computed_reasoning_effort) = computed_reasoning_effort {
+			// -- For gemini-3 use the thinkingLevel if Low or High (does not support medium for now)
+			if provider_model_name.contains("gemini-3") {
+				match computed_reasoning_effort {
+					ReasoningEffort::Low | ReasoningEffort::Minimal => {
+						payload.x_insert("/generationConfig/thinkingConfig/thinkingLevel", "LOW")?;
+					}
+					ReasoningEffort::High | ReasoningEffort::Max => {
+						payload.x_insert("/generationConfig/thinkingConfig/thinkingLevel", "HIGH")?;
+					}
+					// Fallback on thinkingBudget
+					other => {
+						insert_gemini_thinking_budget_value(&mut payload, &other)?;
+					}
+				}
+			}
+			// -- Otherwise, Do thinking budget
+			else {
+				insert_gemini_thinking_budget_value(&mut payload, &computed_reasoning_effort)?;
+			}
+		}
+
+		// -- Opt-in for includeThoughts: only request thought content when
+		// the caller explicitly asks for reasoning content capture.
+		// Thought *signatures* are always returned by the API regardless of this flag.
+		if options_set.capture_reasoning_content() == Some(true) {
+			payload.x_insert("/generationConfig/thinkingConfig/includeThoughts", true)?;
+		}
+
+		// Note: It's unclear from the spec if the content of systemInstruction should have a role.
+		//       Right now, it is omitted (since the spec states it can only be "user" or "model")
+		//       It seems to work. https://ai.google.dev/api/rest/v1beta/models/generateContent
+		if let Some(system) = system {
+			payload.x_insert("systemInstruction", json!({ "parts": [{ "text": system }] }))?;
+		}
+
+		// -- Tools
+		if let Some(tools) = tools {
+			payload.x_insert("tools", tools)?;
+		}
+
+		// -- Response Format
+		if let Some(ChatResponseFormat::JsonSpec(st_json)) = options_set.response_format() {
+			payload.x_insert("/generationConfig/responseMimeType", "application/json")?;
+			let mut schema = st_json.schema.clone();
+			super::openapi_schema::to_openapi_schema(&mut schema);
+			payload.x_insert("/generationConfig/responseJsonSchema", schema)?;
+		}
+
+		// -- Add supported ChatOptions
+		if let Some(temperature) = options_set.temperature() {
+			payload.x_insert("/generationConfig/temperature", temperature)?;
+		}
+		if !options_set.stop_sequences().is_empty() {
+			payload.x_insert("/generationConfig/stopSequences", options_set.stop_sequences())?;
+		}
+		if let Some(max_tokens) = options_set.max_tokens() {
+			payload.x_insert("/generationConfig/maxOutputTokens", max_tokens)?;
+		}
+		if let Some(top_p) = options_set.top_p() {
+			payload.x_insert("/generationConfig/topP", top_p)?;
+		}
+
+		Ok((payload, provider_model_name.to_string()))
 	}
 
 	/// See gemini doc: https://ai.google.dev/api/generate-content#UsageMetadata
-	pub(super) fn into_usage(mut usage_value: Value) -> Usage {
+	pub(in crate::adapter) fn into_usage(mut usage_value: Value) -> Usage {
 		let total_tokens: Option<i32> = usage_value.x_take("totalTokenCount").ok();
 
 		// -- Compute prompt tokens
@@ -426,6 +553,7 @@ impl GeminiAdapter {
 		let g_cached_tokens: Option<i32> = usage_value.x_take("cachedContentTokenCount").ok();
 		let prompt_tokens_details = g_cached_tokens.map(|g_cached_tokens| PromptTokensDetails {
 			cache_creation_tokens: None,
+			cache_creation_details: None,
 			cached_tokens: Some(g_cached_tokens),
 			audio_tokens: None,
 		});
@@ -480,7 +608,7 @@ impl GeminiAdapter {
 	/// - `ChatRole::System` is concatenated (with an empty line) into a single `system` for the system instruction.
 	///   - This adapter uses version v1beta, which supports `systemInstruction`
 	/// - The eventual `chat_req.system` is pushed first into the "systemInstruction"
-	fn into_gemini_request_parts(
+	pub(in crate::adapter) fn into_gemini_request_parts(
 		model_iden: &ModelIden, // use for error reporting
 		chat_req: ChatRequest,
 	) -> Result<GeminiChatRequestParts> {
@@ -496,296 +624,167 @@ impl GeminiAdapter {
 			match msg.role {
 				// For now, system goes as "user" (later, we might have adapter_config.system_to_user_impl)
 				ChatRole::System => {
-					let MessageContent::Text(content) = msg.content else {
-						return Err(Error::MessageContentTypeNotSupported {
-							model_iden: model_iden.clone(),
-							cause: "Only MessageContent::Text supported for this model (for now)",
-						});
-					};
-					systems.push(content)
+					if let Some(content) = msg.content.into_joined_texts() {
+						systems.push(content);
+					}
 				}
 				ChatRole::User => {
-					let content = match msg.content {
-						MessageContent::Text(content) => json!([{"text": content}]),
-						MessageContent::Parts(parts) => {
-							json!(
-								parts
-									.iter()
-									.filter_map(|part| match part {
-										ContentPart::Text(text) => Some(json!({"text": text.clone()})),
-										ContentPart::Image { content_type, source } => {
-											match source {
-												ImageSource::Url(_url) => {
-													// URLs should have been converted to base64 by Pattern for Gemini
-													tracing::warn!(
-														"Gemini received URL image that should have been converted to base64"
-													);
-													None
-												}
-												ImageSource::Base64(content) => Some(json!({
-													"inline_data": {
-														"mime_type": content_type,
-														"data": content
-													}
-												})),
-											}
+					let mut parts_values: Vec<Value> = Vec::new();
+					for part in msg.content {
+						match part {
+							ContentPart::Text(text) => parts_values.push(json!({"text": text})),
+							ContentPart::Binary(binary) => {
+								let Binary {
+									content_type, source, ..
+								} = binary;
+								match &source {
+									BinarySource::Url(url) => parts_values.push(json!({
+										"file_data": {
+											"mime_type": content_type,
+											"file_uri": url
 										}
-									})
-									.collect::<Vec<Value>>()
-							)
+									})),
+									BinarySource::Base64(content) => parts_values.push(json!({
+										"inline_data": {
+											"mime_type": content_type,
+											"data": content
+										}
+									})),
+								}
+							}
+							ContentPart::ToolCall(tool_call) => {
+								parts_values.push(json!({
+									"functionCall": {
+										"name": tool_call.fn_name,
+										"args": tool_call.fn_arguments,
+									}
+								}));
+							}
+							ContentPart::ToolResponse(tool_response) => {
+								parts_values.push(json!({
+									"functionResponse": {
+										"name": tool_response.call_id,
+										"response": {
+											"name": tool_response.call_id,
+											"content": content_as_string(&tool_response.content),
+										}
+									}
+								}));
+							}
+							ContentPart::ThinkingBlock(_) => {}
+							// Custom are ignored for this logic
+							ContentPart::Custom(_) => {}
 						}
-						MessageContent::ToolCalls(tool_calls) => {
-							json!(
-								tool_calls
-									.into_iter()
-									.map(|tool_call| {
-										json!({
-											"functionCall": {
-												"name": tool_call.fn_name,
-												"args": tool_call.fn_arguments,
-											}
-										})
-									})
-									.collect::<Vec<Value>>()
-							)
-						}
-						MessageContent::ToolResponses(tool_responses) => {
-							json!(
-								tool_responses
-									.into_iter()
-									.map(|tool_response| {
-										json!({
-											"functionResponse": {
-												"name": tool_response.call_id,
-												"response": {
-													"name": tool_response.call_id,
-													"content": tool_response.content,
-												}
-											}
-										})
-									})
-									.collect::<Vec<Value>>()
-							)
-						}
-						MessageContent::Blocks(blocks) => {
-							// Convert blocks to Gemini parts format
-							json!(
-								blocks
-									.into_iter()
-									.filter_map(|block| match block {
-										ContentBlock::Text {
-											text,
-											thought_signature,
-										} => {
-											let mut part = json!({"text": text});
-											// Only include gemini signatures
-											if let Some(sig) = thought_signature {
-												if sig.starts_with("gemini:") {
-													part["thoughtSignature"] =
-														json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-												}
-											}
-											Some(part)
-										}
-										ContentBlock::Thinking { text, signature } => {
-											let mut part = json!({"text": text, "thought": true});
-											// Only include gemini signatures
-											if let Some(sig) = signature {
-												if sig.starts_with("gemini:") {
-													part["thoughtSignature"] =
-														json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-												}
-											}
-											Some(part)
-										}
-										ContentBlock::ToolUse {
-											id: _,
-											name,
-											input,
-											thought_signature,
-										} => {
-											let mut part = json!({
-												"functionCall": {
-													"name": name,
-													"args": input,
-												}
-											});
-											// Only include gemini signatures
-											if let Some(sig) = thought_signature {
-												if sig.starts_with("gemini:") {
-													part["thoughtSignature"] =
-														json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-												}
-											}
-											Some(part)
-										}
-										ContentBlock::ToolResult {
-											tool_use_id,
-											content,
-											is_error,
-											thought_signature,
-										} => {
-											let mut response_obj = json!({
-												"name": tool_use_id,
-												"content": content,
-											});
-											if let Some(true) = is_error {
-												response_obj["is_error"] = json!(true);
-											}
-											let mut part = json!({
-												"functionResponse": {
-													"name": tool_use_id,
-													"response": response_obj,
-												}
-											});
-											// Only include gemini signatures
-											if let Some(sig) = thought_signature {
-												if sig.starts_with("gemini:") {
-													part["thoughtSignature"] =
-														json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-												}
-											}
-											Some(part)
-										}
-										_ => None, // Skip other block types like RedactedThinking
-									})
-									.collect::<Vec<Value>>()
-							)
-						}
-					};
+					}
 
-					contents.push(json!({"role": "user", "parts": content}));
+					contents.push(json!({"role": "user", "parts": parts_values}));
 				}
 				ChatRole::Assistant => {
-					match msg.content {
-						MessageContent::Text(content) => {
-							contents.push(json!({"role": "model", "parts": [{"text": content}]}))
-						}
-						MessageContent::ToolCalls(tool_calls) => contents.push(json!({
-							"role": "model",
-							"parts": tool_calls
-								.into_iter()
-								.map(|tool_call| {
-									json!({
-										"functionCall": {
-											"name": tool_call.fn_name,
-											"args": tool_call.fn_arguments,
-										}
-									})
-								})
-								.collect::<Vec<Value>>()
-						})),
-						MessageContent::Blocks(blocks) => {
-							// Convert blocks to Gemini parts format
-							let parts = blocks
-								.into_iter()
-								.filter_map(|block| match block {
-									ContentBlock::Text {
-										text,
-										thought_signature,
-									} => {
-										let mut part = json!({"text": text});
-										// Only include gemini signatures
-										if let Some(sig) = thought_signature {
-											if sig.starts_with("gemini:") {
-												part["thoughtSignature"] =
-													json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-											}
-										}
-										Some(part)
-									}
-									ContentBlock::Thinking { text, signature } => {
-										let mut part = json!({"text": text, "thought": true});
-										// Only include gemini signatures
-										if let Some(sig) = signature {
-											if sig.starts_with("gemini:") {
-												part["thoughtSignature"] =
-													json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-											}
-										}
-										Some(part)
-									}
-									ContentBlock::ToolUse {
-										id: _,
-										name,
-										input,
-										thought_signature,
-									} => {
-										let mut part = json!({
-											"functionCall": {
-												"name": name,
-												"args": input,
-											}
-										});
-										// Only include gemini signatures
-										if let Some(sig) = thought_signature {
-											if sig.starts_with("gemini:") {
-												part["thoughtSignature"] =
-													json!(sig.strip_prefix("gemini:").unwrap_or(&sig));
-											}
-										}
-										Some(part)
-									}
-									_ => None, // Skip other block types
-								})
-								.collect::<Vec<Value>>();
+					let mut parts_values: Vec<Value> = Vec::new();
+					let mut is_first_tool_call = true;
 
-							if !parts.is_empty() {
-								contents.push(json!({"role": "model", "parts": parts}));
+					for part in msg.content {
+						match part {
+							ContentPart::Text(text) => {
+								parts_values.push(json!({"text": text}));
 							}
+							ContentPart::ToolCall(tool_call) => {
+								let mut part_obj = serde_json::Map::new();
+								part_obj.insert(
+									"functionCall".to_string(),
+									json!({
+										"name": tool_call.fn_name,
+										"args": tool_call.fn_arguments,
+									}),
+								);
+
+								// For Gemini 3 models, the first tool call with no preceding
+								// thought signature requires a sentinel flag so the API
+								// validator does not reject the request.
+								// See: https://ai.google.dev/gemini-api/docs/thought-signatures#faqs
+								let is_gemini_3 = model_iden.model_name.contains("gemini-3");
+								if is_gemini_3 && is_first_tool_call {
+									part_obj.insert(
+										"thoughtSignature".to_string(),
+										json!("skip_thought_signature_validator"),
+									);
+								}
+
+								parts_values.push(Value::Object(part_obj));
+								is_first_tool_call = false;
+							}
+							ContentPart::ThinkingBlock(block) => {
+								// Only pass Gemini-native signed blocks back to Gemini.
+								// Blocks from other providers (Anthropic, OpenAI) carry
+								// opaque signatures that Gemini cannot validate; they are
+								// silently dropped to avoid wire errors. Unsigned blocks
+								// (reasoning text only) have no Gemini wire representation.
+								if block.provenance == AdapterKind::Gemini
+									&& let Some(sig) = block.signature
+								{
+									// Gemini native round-trip: emit the thoughtSignature on
+									// the first tool call part if one follows. If there is no
+									// tool call yet, emit as a standalone part (rare case).
+									// For simplicity we emit standalone here; the sentinel
+									// injection below handles the tool-call pairing.
+									parts_values.push(json!({ "thoughtSignature": sig }));
+								}
+							}
+							// Ignore unsupported parts for Assistant role.
+							ContentPart::Binary(_) => {}
+							ContentPart::ToolResponse(_) => {}
+							// Custom are ignored for this logic.
+							ContentPart::Custom(_) => {}
 						}
-						_ => {
-							return Err(Error::MessageContentTypeNotSupported {
-								model_iden: model_iden.clone(),
-								cause: "Only MessageContent::Text and MessageContent::ToolCalls supported for this model (for now)",
-							});
-						}
-					};
+					}
+					if !parts_values.is_empty() {
+						contents.push(json!({"role": "model", "parts": parts_values}));
+					}
 				}
 				ChatRole::Tool => {
-					let content = match msg.content {
-						MessageContent::ToolCalls(tool_calls) => {
-							json!(
-								tool_calls
-									.into_iter()
-									.map(|tool_call| {
-										json!({
-											"functionCall": {
-												"name": tool_call.fn_name,
-												"args": tool_call.fn_arguments,
-											}
-										})
-									})
-									.collect::<Vec<Value>>()
-							)
+					let mut parts_values: Vec<Value> = Vec::new();
+					for part in msg.content {
+						match part {
+							ContentPart::ToolCall(tool_call) => {
+								parts_values.push(json!({
+									"functionCall": {
+										"name": tool_call.fn_name,
+										"args": tool_call.fn_arguments,
+									}
+								}));
+							}
+							ContentPart::ToolResponse(tool_response) => {
+								parts_values.push(json!({
+									"functionResponse": {
+										"name": tool_response.call_id,
+										"response": {
+											"name": tool_response.call_id,
+											// Gemini requires a flat string; stringify structured
+											// content (e.g. Anthropic nested block arrays).
+											"content": content_as_string(&tool_response.content),
+										}
+									}
+								}));
+							}
+							ContentPart::ThinkingBlock(block) => {
+								// Gemini-native signed signatures can be forwarded on the Tool role.
+								// Signatures from other providers are dropped.
+								if block.provenance == AdapterKind::Gemini
+									&& let Some(sig) = block.signature
+								{
+									parts_values.push(json!({ "thoughtSignature": sig }));
+								}
+							}
+							_ => {
+								return Err(Error::MessageContentTypeNotSupported {
+									model_iden: model_iden.clone(),
+									cause: "ChatRole::Tool can only contain ToolCall, ToolResponse, or Thought content parts",
+								});
+							}
 						}
-						MessageContent::ToolResponses(tool_responses) => {
-							json!(
-								tool_responses
-									.into_iter()
-									.map(|tool_response| {
-										json!({
-											"functionResponse": {
-												"name": tool_response.call_id,
-												"response": {
-													"name": tool_response.call_id,
-													"content": tool_response.content,
-												}
-											}
-										})
-									})
-									.collect::<Vec<Value>>()
-							)
-						}
-						_ => {
-							return Err(Error::MessageContentTypeNotSupported {
-								model_iden: model_iden.clone(),
-								cause: "ChatRole::Tool can only be MessageContent::ToolCall or MessageContent::ToolResponse",
-							});
-						}
-					};
+					}
 
-					contents.push(json!({"role": "user", "parts": content}));
+					contents.push(json!({"role": "user", "parts": parts_values}));
 				}
 			}
 		}
@@ -796,6 +795,11 @@ impl GeminiAdapter {
 			None
 		};
 
+		// -- Post-process: merge consecutive tool-response "user" entries into a single entry.
+		// Gemini FC protocol requires all functionResponse parts to be in one "user" turn
+		// following the "model" turn with functionCall parts.
+		let contents = Self::merge_consecutive_tool_response_entries(contents);
+
 		// -- Build tools
 		let tools = if let Some(req_tools) = chat_req.tools {
 			let mut tools: Vec<Value> = Vec::new();
@@ -803,26 +807,13 @@ impl GeminiAdapter {
 			//       The rest are builtins
 			let mut function_declarations: Vec<Value> = Vec::new();
 			for req_tool in req_tools {
-				// -- if it is a builtin tool
-				if matches!(
-					req_tool.name.as_str(),
-					"googleSearch" | "googleSearchRetrieval" | "codeExecution" | "urlContext"
-				) {
-					tools.push(json!({req_tool.name: req_tool.config}));
-				}
-				// -- otherwise, user tool
-				else {
-					function_declarations.push(json! {
-						{
-							"name": req_tool.name,
-							"description": req_tool.description,
-							"parameters": req_tool.schema,
-						}
-					})
+				match Self::tool_to_gemini_tool(req_tool)? {
+					GeminiTool::Builtin(value) => tools.push(value),
+					GeminiTool::User(value) => function_declarations.push(value),
 				}
 			}
 			if !function_declarations.is_empty() {
-				tools.push(json!({"function_declarations": function_declarations}));
+				tools.push(json!({"functionDeclarations": function_declarations}));
 			}
 			Some(tools)
 		} else {
@@ -835,29 +826,546 @@ impl GeminiAdapter {
 			tools,
 		})
 	}
+
+	fn tool_to_gemini_tool(tool: Tool) -> Result<GeminiTool> {
+		let Tool {
+			name,
+			description,
+			schema,
+			config,
+			..
+		} = tool;
+
+		// Built-in WebSearch for Gemini
+		let name_str = match &name {
+			ToolName::WebSearch => "googleSearch",
+			ToolName::Custom(name) => name.as_str(),
+		};
+
+		// -- if it is a builtin tool
+		if matches!(
+			name_str,
+			"googleSearch" | "googleSearchRetrieval" | "codeExecution" | "urlContext"
+		) {
+			let config = match config {
+				// GoogleSearch does not take any config for now
+				Some(ToolConfig::WebSearch(_config)) => Some(json!({})),
+				// If custom, user knows better
+				Some(ToolConfig::Custom(config)) => Some(config),
+				// For now, none is empty
+				None => None,
+			};
+			Ok(GeminiTool::Builtin(json!({ name_str: config })))
+		}
+		// -- otherwise, user tool
+		else {
+			let mut parameters = schema.unwrap_or(Value::Null);
+			super::openapi_schema::to_openapi_schema(&mut parameters);
+			let parameters = if parameters.is_null() { None } else { Some(parameters) };
+			Ok(GeminiTool::User(json!({
+				"name": name_str,
+				"description": description,
+				"parameters": parameters,
+			})))
+		}
+	}
 }
 
-// struct Gemini
+impl GeminiAdapter {
+	/// Merge consecutive "user" entries that contain only functionResponse parts
+	/// into a single entry. Gemini requires all function responses in one turn.
+	fn merge_consecutive_tool_response_entries(contents: Vec<Value>) -> Vec<Value> {
+		fn is_tool_response_entry(entry: &Value) -> bool {
+			if entry.get("role").and_then(|r| r.as_str()) != Some("user") {
+				return false;
+			}
+			if let Some(parts) = entry.get("parts").and_then(|p| p.as_array()) {
+				!parts.is_empty() && parts.iter().all(|p| p.get("functionResponse").is_some())
+			} else {
+				false
+			}
+		}
+
+		let mut result: Vec<Value> = Vec::with_capacity(contents.len());
+		for entry in contents {
+			if is_tool_response_entry(&entry) {
+				// Check if previous entry is also a tool response — merge
+				if let Some(prev) = result.last_mut()
+					&& is_tool_response_entry(prev)
+					&& let (Some(prev_parts), Some(new_parts)) = (
+						prev.get_mut("parts").and_then(|p| p.as_array_mut()),
+						entry.get("parts").and_then(|p| p.as_array()),
+					) {
+					prev_parts.extend(new_parts.iter().cloned());
+					continue;
+				}
+			}
+			result.push(entry);
+		}
+		result
+	}
+}
+
+pub enum GeminiTool {
+	Builtin(Value),
+	User(Value),
+}
 
 /// FIXME: need to be Vec<GeminiChatContent>
-pub(super) struct GeminiChatResponse {
+pub(in crate::adapter) struct GeminiChatResponse {
 	pub content: Vec<GeminiChatContent>,
 	pub usage: Usage,
+	pub stop_reason: Option<String>,
 }
 
-pub(super) enum GeminiChatContent {
+pub(in crate::adapter) enum GeminiChatContent {
 	Text(String),
-	Thinking { text: String, signature: Option<String> },
+	Binary(Binary),
 	ToolCall(ToolCall),
+	Reasoning(String),
+	ThoughtSignature(String),
 }
 
-struct GeminiChatRequestParts {
-	system: Option<String>,
+pub(in crate::adapter) struct GeminiChatRequestParts {
+	pub system: Option<String>,
 	/// The chat history (user and assistant, except for the last user message which is a message)
-	contents: Vec<Value>,
+	pub contents: Vec<Value>,
 
 	/// The tools to use
-	tools: Option<Vec<Value>>,
+	pub tools: Option<Vec<Value>>,
 }
 
-// endregion: --- Support
+// region:    --- Helpers
+
+/// Extract and remove a string field from a JSON Value.
+fn take_string(v: &mut Value, key: &str) -> Option<String> {
+	v.as_object_mut()
+		.and_then(|m| m.remove(key))
+		.and_then(|v| if let Value::String(s) = v { Some(s) } else { None })
+}
+
+/// Extract and remove a boolean field from a JSON Value, defaulting to false.
+fn take_bool(v: &mut Value, key: &str) -> bool {
+	v.as_object_mut()
+		.and_then(|m| m.remove(key))
+		.and_then(|v| v.as_bool())
+		.unwrap_or(false)
+}
+
+// endregion: --- Helpers
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn merge_consecutive_tool_responses() {
+		let contents = vec![
+			json!({"role": "model", "parts": [{"functionCall": {"name": "read", "args": {}}}]}),
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "call1", "response": {"content": "a"}}}]}),
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "call2", "response": {"content": "b"}}}]}),
+		];
+		let merged = GeminiAdapter::merge_consecutive_tool_response_entries(contents);
+		assert_eq!(merged.len(), 2); // model + single merged user
+		let parts = merged[1].get("parts").unwrap().as_array().unwrap();
+		assert_eq!(parts.len(), 2); // both functionResponse in one entry
+	}
+
+	#[test]
+	fn merge_does_not_merge_non_tool_user_entries() {
+		let contents = vec![
+			json!({"role": "user", "parts": [{"text": "hello"}]}),
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "c1", "response": {"content": "x"}}}]}),
+		];
+		let merged = GeminiAdapter::merge_consecutive_tool_response_entries(contents);
+		assert_eq!(merged.len(), 2); // not merged — first is text, not tool response
+	}
+
+	#[test]
+	fn merge_three_consecutive_tool_responses() {
+		let contents = vec![
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "c1", "response": {"content": "a"}}}]}),
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "c2", "response": {"content": "b"}}}]}),
+			json!({"role": "user", "parts": [{"functionResponse": {"name": "c3", "response": {"content": "c"}}}]}),
+		];
+		let merged = GeminiAdapter::merge_consecutive_tool_response_entries(contents);
+		assert_eq!(merged.len(), 1);
+		let parts = merged[0].get("parts").unwrap().as_array().unwrap();
+		assert_eq!(parts.len(), 3);
+	}
+
+	#[test]
+	fn tool_call_id_uses_counter() {
+		// Simulate Gemini response with two functionCalls for the same tool
+		let body = json!({
+			"candidates": [{
+				"content": {
+					"role": "model",
+					"parts": [
+						{"functionCall": {"name": "read_file", "args": {"path": "a.rs"}}},
+						{"functionCall": {"name": "read_file", "args": {"path": "b.rs"}}}
+					]
+				}
+			}],
+			"usageMetadata": {"totalTokenCount": 100}
+		});
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-test");
+		let response = GeminiAdapter::body_to_gemini_chat_response(&model_iden, body).unwrap();
+		let tool_calls: Vec<_> = response
+			.content
+			.into_iter()
+			.filter_map(|c| {
+				if let GeminiChatContent::ToolCall(tc) = c {
+					Some(tc)
+				} else {
+					None
+				}
+			})
+			.collect();
+		assert_eq!(tool_calls.len(), 2);
+		assert_ne!(tool_calls[0].call_id, tool_calls[1].call_id);
+		assert!(tool_calls[0].call_id.contains("read_file"));
+		assert!(tool_calls[1].call_id.contains("read_file"));
+	}
+
+	#[test]
+	fn body_to_gemini_chat_response_accepts_usage_only_stream_tail() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-2.5-flash");
+		let response = GeminiAdapter::body_to_gemini_chat_response(
+			&model_iden,
+			json!({
+				"candidates": [
+					{
+						"finishReason": "STOP"
+					}
+				],
+				"usageMetadata": {
+					"promptTokenCount": 10,
+					"candidatesTokenCount": 4,
+					"totalTokenCount": 14
+				}
+			}),
+		)
+		.expect("usage-only stream tail should not be treated as an error");
+
+		assert!(response.content.is_empty());
+		assert_eq!(response.usage.total_tokens, Some(14));
+		assert_eq!(response.usage.prompt_tokens, Some(10));
+		assert_eq!(response.usage.completion_tokens, Some(4));
+		assert_eq!(response.stop_reason.as_deref(), Some("STOP"));
+	}
+
+	#[test]
+	fn body_to_gemini_chat_response_accepts_tail_with_null_finish_reason() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-2.5-flash");
+		let response = GeminiAdapter::body_to_gemini_chat_response(
+			&model_iden,
+			json!({
+				"candidates": [
+					{
+						"finishReason": null
+					}
+				],
+				"usageMetadata": {
+					"promptTokenCount": 10,
+					"candidatesTokenCount": 4,
+					"totalTokenCount": 14
+				}
+			}),
+		)
+		.expect("usage-only stream tail with null finishReason should not be an error");
+
+		assert!(response.content.is_empty());
+		assert_eq!(response.usage.total_tokens, Some(14));
+	}
+
+	#[test]
+	fn body_to_gemini_chat_response_still_rejects_missing_candidates() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-2.5-flash");
+		let result = GeminiAdapter::body_to_gemini_chat_response(
+			&model_iden,
+			json!({
+				"usageMetadata": {
+					"promptTokenCount": 10,
+					"candidatesTokenCount": 4,
+					"totalTokenCount": 14
+				}
+			}),
+		);
+
+		let err = match result {
+			Err(e) => e,
+			Ok(_) => panic!("missing candidates should still be rejected"),
+		};
+		assert!(matches!(err, Error::ChatResponse { .. }));
+	}
+
+	/// Cross-provider safety: an assistant message that arrived from a previous
+	/// Anthropic turn may carry ThinkingBlock parts with Anthropic provenance.
+	/// These must be silently dropped on Gemini outbound serialization so that
+	/// opaque Anthropic-format blobs are never forwarded to the Gemini wire API.
+	/// Text and ToolCall parts must be preserved unchanged.
+	#[test]
+	fn assistant_drops_thought_signature_and_reasoning_content_on_outbound() {
+		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ThinkingBlock, ToolCall};
+
+		let tool_call = ToolCall {
+			call_id: "call_1".to_string(),
+			fn_name: "search".to_string(),
+			fn_arguments: json!({"query": "rust"}),
+			thought_signatures: None,
+			thought_signatures_provenance: None,
+		};
+
+		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
+			// Anthropic-originated opaque signature — must be dropped (wrong provenance).
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(
+				AdapterKind::Anthropic,
+				"I think I should search.",
+				"ANTHROPIC_OPAQUE_BYTES",
+			)),
+			ContentPart::Text("I will search for that.".to_string()),
+			ContentPart::ToolCall(tool_call),
+		]));
+
+		let chat_req = ChatRequest::new(vec![ChatMessage::user("Search for rust"), assistant_msg]);
+
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-2.5-flash");
+		let parts = GeminiAdapter::into_gemini_request_parts(&model_iden, chat_req)
+			.expect("serialization should not fail on cross-provider reasoning parts");
+
+		// Find the model (assistant) entry.
+		let model_entry = parts
+			.contents
+			.iter()
+			.find(|c| c.get("role").and_then(|r| r.as_str()) == Some("model"))
+			.expect("model entry must be present");
+
+		let wire_parts = model_entry
+			.get("parts")
+			.and_then(|p| p.as_array())
+			.expect("parts must be array");
+
+		// ThoughtSignature and ReasoningContent must not appear as top-level keys.
+		for wire_part in wire_parts {
+			assert!(
+				wire_part.get("thoughtSignature").is_none() || wire_part.get("functionCall").is_some(),
+				"thoughtSignature must only appear as a Gemini-3 sentinel on functionCall parts, not as a standalone part from Anthropic-originated signatures"
+			);
+			assert!(
+				wire_part.get("reasoningContent").is_none(),
+				"reasoningContent must not appear in the Gemini wire payload"
+			);
+		}
+
+		// The text part must be present.
+		let has_text = wire_parts
+			.iter()
+			.any(|p| p.get("text").and_then(|t| t.as_str()) == Some("I will search for that."));
+		assert!(has_text, "text part must be preserved");
+
+		// The tool call must be present.
+		let has_tool_call = wire_parts
+			.iter()
+			.any(|p| p.get("functionCall").and_then(|fc| fc.get("name")).and_then(|n| n.as_str()) == Some("search"));
+		assert!(has_tool_call, "tool call part must be preserved");
+
+		// No standalone thoughtSignature-only part (i.e. no part with only thoughtSignature and no functionCall).
+		let has_standalone_thought_sig = wire_parts
+			.iter()
+			.any(|p| p.get("thoughtSignature").is_some() && p.get("functionCall").is_none());
+		assert!(
+			!has_standalone_thought_sig,
+			"no standalone thoughtSignature parts should be emitted from Anthropic-originated parts"
+		);
+	}
+
+	/// A 2-function-call response where each part carries its own thoughtSignature.
+	/// This is the primary Gemini 3 multi-tool-call case. Each ToolCall must receive
+	/// its own distinct signature — not a shared list and not the wrong signature.
+	#[test]
+	fn inbound_two_function_calls_each_get_own_signature() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+		let body = json!({
+			"candidates": [{
+				"content": {
+					"role": "model",
+					"parts": [
+						{
+							// Part 1: reasoning + first tool call.
+							"thoughtSignature": "sig_for_read",
+							"functionCall": {"name": "read_file", "args": {"path": "a.rs"}}
+						},
+						{
+							// Part 2: reasoning + second tool call.
+							"thoughtSignature": "sig_for_write",
+							"functionCall": {"name": "write_file", "args": {"path": "b.rs", "content": "hi"}}
+						}
+					]
+				}
+			}],
+			"usageMetadata": {"totalTokenCount": 200}
+		});
+
+		let chat_response = GeminiAdapter::to_chat_response(
+			model_iden,
+			crate::webc::WebResponse {
+				status: reqwest::StatusCode::OK,
+				body,
+			},
+			ChatOptionsSet::default(),
+		)
+		.unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 2, "expected exactly 2 tool calls");
+
+		let read_call = tool_calls
+			.iter()
+			.find(|tc| tc.fn_name == "read_file")
+			.expect("read_file not found");
+		let write_call = tool_calls
+			.iter()
+			.find(|tc| tc.fn_name == "write_file")
+			.expect("write_file not found");
+
+		// Each call must have exactly one signature — its own, not the other's.
+		let read_sigs = read_call.thought_signatures.as_deref().unwrap_or(&[]);
+		let write_sigs = write_call.thought_signatures.as_deref().unwrap_or(&[]);
+		assert_eq!(read_sigs, &["sig_for_read"], "read_file must carry only sig_for_read");
+		assert_eq!(
+			write_sigs,
+			&["sig_for_write"],
+			"write_file must carry only sig_for_write"
+		);
+
+		// Provenance must be set to Gemini on both.
+		assert_eq!(read_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
+		assert_eq!(write_call.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// Both signatures must also appear as ThinkingBlock content parts.
+		let thinking_sigs: Vec<&str> = chat_response.content.iter().filter_map(|p| p.as_thought_signature()).collect();
+		assert!(
+			thinking_sigs.contains(&"sig_for_read"),
+			"sig_for_read must appear as ThinkingBlock"
+		);
+		assert!(
+			thinking_sigs.contains(&"sig_for_write"),
+			"sig_for_write must appear as ThinkingBlock"
+		);
+	}
+
+	/// Edge case: one signature, two tool calls. Only the first tool call should
+	/// get the signature; the second gets none.
+	#[test]
+	fn inbound_one_signature_two_tool_calls_assigns_to_first() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+
+		// We test at the body_to_gemini_chat_response + to_chat_response level.
+		// Wire: part1 has sig+call, part2 has only call (no sig).
+		let web_response = crate::webc::WebResponse {
+			status: reqwest::StatusCode::OK,
+			body: json!({
+				"candidates": [{
+					"content": {
+						"role": "model",
+						"parts": [
+							{
+								"thoughtSignature": "only_sig",
+								"functionCall": {"name": "tool_a", "args": {}}
+							},
+							{
+								// No thoughtSignature on this part.
+								"functionCall": {"name": "tool_b", "args": {}}
+							}
+						]
+					}
+				}],
+				"usageMetadata": {"totalTokenCount": 50}
+			}),
+		};
+
+		let chat_response =
+			GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 2);
+
+		let tool_a = tool_calls.iter().find(|tc| tc.fn_name == "tool_a").expect("tool_a not found");
+		let tool_b = tool_calls.iter().find(|tc| tc.fn_name == "tool_b").expect("tool_b not found");
+
+		// tool_a gets the signature.
+		assert_eq!(
+			tool_a.thought_signatures.as_deref(),
+			Some(&[String::from("only_sig")][..])
+		);
+		assert_eq!(tool_a.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// tool_b gets no signature.
+		assert!(tool_b.thought_signatures.is_none(), "tool_b must have no signature");
+		assert!(tool_b.thought_signatures_provenance.is_none());
+	}
+
+	/// Edge case: two signatures, one tool call. The second (consecutive) signature
+	/// is the orphan — it has no preceding tool call at the time it arrives so it
+	/// must be attached to the last tool call with a warning, leaving the first call
+	/// with both signatures on it.
+	#[test]
+	fn inbound_two_signatures_one_tool_call_attaches_extra_to_last() {
+		let model_iden = ModelIden::new(AdapterKind::Gemini, "gemini-3-flash");
+
+		// Wire: part1 has sig1 only (no functionCall), part2 has sig2 + functionCall.
+		// This means: sig1 arrives → pending=sig1; sig2 arrives → orphan sig1 is
+		// attached to last tool call (none yet, so dropped with warning), pending=sig2;
+		// ToolCall arrives → paired with sig2.
+		//
+		// If instead the wire is: part1 has sig1+call1, part2 has sig2 (no call):
+		// sig1 arrives → pending=sig1; call1 arrives → paired with sig1; sig2 arrives
+		// → pending=sig2; (end) → leftover sig2 attached to call1 (last tool call).
+		//
+		// We test the latter shape since it is more realistic (a trailing orphan).
+		let web_response = crate::webc::WebResponse {
+			status: reqwest::StatusCode::OK,
+			body: json!({
+				"candidates": [{
+					"content": {
+						"role": "model",
+						"parts": [
+							{
+								"thoughtSignature": "sig_first",
+								"functionCall": {"name": "only_tool", "args": {}}
+							},
+							{
+								// Trailing signature with no associated functionCall.
+								"thoughtSignature": "sig_orphan"
+							}
+						]
+					}
+				}],
+				"usageMetadata": {"totalTokenCount": 30}
+			}),
+		};
+
+		let chat_response =
+			GeminiAdapter::to_chat_response(model_iden, web_response, ChatOptionsSet::default()).unwrap();
+
+		let tool_calls: Vec<&ToolCall> = chat_response.content.iter().filter_map(|p| p.as_tool_call()).collect();
+		assert_eq!(tool_calls.len(), 1, "expected exactly 1 tool call");
+
+		let only_tool = &tool_calls[0];
+		// The primary signature must be present.
+		let sigs = only_tool.thought_signatures.as_deref().unwrap_or(&[]);
+		assert!(sigs.contains(&"sig_first".to_string()), "sig_first must be attached");
+		// The orphan trailing signature must also be attached to the only call.
+		assert!(
+			sigs.contains(&"sig_orphan".to_string()),
+			"orphan sig_orphan must be attached to last tool call"
+		);
+		assert_eq!(only_tool.thought_signatures_provenance, Some(AdapterKind::Gemini));
+
+		// Both signatures must appear as ThinkingBlock parts.
+		let thinking_sigs: Vec<&str> = chat_response.content.iter().filter_map(|p| p.as_thought_signature()).collect();
+		assert!(thinking_sigs.contains(&"sig_first"));
+		assert!(thinking_sigs.contains(&"sig_orphan"));
+	}
+}

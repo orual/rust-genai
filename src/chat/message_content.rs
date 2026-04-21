@@ -1,213 +1,560 @@
-use crate::chat::{ToolCall, ToolResponse};
-use derive_more::derive::From;
+/// Note: MessageContent is used for ChatRequest and ChatResponse.
+use crate::chat::{Binary, ContentPart, CustomPart, ToolCall, ToolResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::sync::Arc;
 
-/// Note: MessageContent is use for the ChatRequest as well as the ChatResponse
-#[derive(Debug, Clone, Serialize, Deserialize, From)]
-pub enum MessageContent {
-	/// Text content
-	#[from(&str, &String, String)]
-	Text(String),
-
-	/// Content parts
-	Parts(Vec<ContentPart>),
-
-	/// Tool calls
-	#[from]
-	ToolCalls(Vec<ToolCall>),
-
-	/// Tool call responses
-	#[from]
-	ToolResponses(Vec<ToolResponse>),
-
-	/// Content blocks - for providers that need exact block sequence preservation (e.g. Anthropic with thinking)
-	Blocks(Vec<ContentBlock>),
+/// Message content container used in ChatRequest and ChatResponse.
+///
+/// Transparent wrapper around a list of ContentPart (Text, Binary, ToolCall, or ToolResponse).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageContent {
+	/// The parts that compose this message.
+	parts: Vec<ContentPart>,
 }
 
 /// Constructors
 impl MessageContent {
-	/// Create a new MessageContent with the Text variant
+	/// Create a message containing a single text part.
 	pub fn from_text(content: impl Into<String>) -> Self {
-		MessageContent::Text(content.into())
+		Self {
+			parts: vec![ContentPart::Text(content.into())],
+		}
 	}
 
-	/// Create a new MessageContent from provided content parts
+	/// Build from the provided content parts.
 	pub fn from_parts(parts: impl Into<Vec<ContentPart>>) -> Self {
-		MessageContent::Parts(parts.into())
+		Self { parts: parts.into() }
 	}
 
-	/// Create a new MessageContent with the ToolCalls variant
+	/// Build from the provided tool calls.
 	pub fn from_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
-		MessageContent::ToolCalls(tool_calls)
+		Self {
+			parts: tool_calls.into_iter().map(ContentPart::ToolCall).collect(),
+		}
+	}
+
+	/// Build from the provided tool responses.
+	pub fn from_tool_responses(tool_responses: Vec<ToolResponse>) -> Self {
+		Self {
+			parts: tool_responses.into_iter().map(ContentPart::ToolResponse).collect(),
+		}
 	}
 }
 
+/// Fluid Setters/Builders
+impl MessageContent {
+	/// Append one part and return self (builder style).
+	pub fn append(mut self, part: impl Into<ContentPart>) -> Self {
+		self.parts.push(part.into());
+		self
+	}
+
+	/// Append one part (mutating).
+	pub fn push(&mut self, part: impl Into<ContentPart>) {
+		self.parts.push(part.into());
+	}
+
+	/// Insert one part at the given index (mutating).
+	pub fn insert(&mut self, index: usize, part: impl Into<ContentPart>) {
+		self.parts.insert(index, part.into());
+	}
+
+	/// Prepend one part to the beginning (mutating).
+	pub fn prepend(&mut self, part: impl Into<ContentPart>) {
+		self.parts.insert(0, part.into());
+	}
+
+	/// Prepend multiple parts while preserving their original order.
+	pub fn extend_front<I>(&mut self, iter: I)
+	where
+		I: IntoIterator<Item = ContentPart>,
+	{
+		// Collect then insert in reverse so that the first element in `iter`
+		// ends up closest to the front after all insertions.
+		let collected: Vec<ContentPart> = iter.into_iter().collect();
+		for part in collected.into_iter().rev() {
+			self.parts.insert(0, part);
+		}
+	}
+
+	/// Extend with an iterator of parts, returning self.
+	pub fn extended<I>(mut self, iter: I) -> Self
+	where
+		I: IntoIterator<Item = ContentPart>,
+	{
+		self.parts.extend(iter);
+		self
+	}
+}
+
+impl Extend<ContentPart> for MessageContent {
+	fn extend<T: IntoIterator<Item = ContentPart>>(&mut self, iter: T) {
+		self.parts.extend(iter);
+	}
+}
+
+/// Computed accessors
+impl MessageContent {
+	/// Returns an approximate in-memory size of this `MessageContent`, in bytes,
+	/// computed as the sum of the sizes of all parts.
+	pub fn size(&self) -> usize {
+		self.parts.iter().map(|p| p.size()).sum()
+	}
+}
+
+// region:    --- Iterator Support
+
+use crate::support;
+use std::iter::FromIterator;
+use std::slice::{Iter, IterMut};
+
+impl IntoIterator for MessageContent {
+	type Item = ContentPart;
+	type IntoIter = std::vec::IntoIter<ContentPart>;
+	fn into_iter(self) -> Self::IntoIter {
+		self.parts.into_iter()
+	}
+}
+
+impl<'a> IntoIterator for &'a MessageContent {
+	type Item = &'a ContentPart;
+	type IntoIter = Iter<'a, ContentPart>;
+	fn into_iter(self) -> Self::IntoIter {
+		self.parts.iter()
+	}
+}
+
+impl<'a> IntoIterator for &'a mut MessageContent {
+	type Item = &'a mut ContentPart;
+	type IntoIter = IterMut<'a, ContentPart>;
+	fn into_iter(self) -> Self::IntoIter {
+		self.parts.iter_mut()
+	}
+}
+
+// collect() support
+impl FromIterator<ContentPart> for MessageContent {
+	fn from_iter<T: IntoIterator<Item = ContentPart>>(iter: T) -> Self {
+		Self {
+			parts: iter.into_iter().collect(),
+		}
+	}
+}
+
+// endregion: --- Iterator Support
+
 /// Getters
 impl MessageContent {
-	/// Returns the MessageContent as &str, only if it is MessageContent::Text
-	/// Otherwise, it returns None.
-	///
-	/// NOTE: When multi-part content is present, this will return None and won't concatenate the text parts.
-	pub fn text(&self) -> Option<&str> {
-		match self {
-			MessageContent::Text(content) => Some(content.as_str()),
-			MessageContent::Parts(_) => None,
-			MessageContent::ToolCalls(_) => None,
-			MessageContent::ToolResponses(_) => None,
-			MessageContent::Blocks(_) => None,
-		}
+	pub fn iter(&self) -> Iter<'_, ContentPart> {
+		self.parts.iter()
 	}
 
-	/// Consumes the MessageContent and returns it as &str,
-	/// only if it is MessageContent::Text; otherwise, it returns None.
-	///
-	/// NOTE: When multi-part content is present, this will return None and won't concatenate the text parts.
-	pub fn into_text(self) -> Option<String> {
-		match self {
-			MessageContent::Text(content) => Some(content),
-			MessageContent::Parts(_) => None,
-			MessageContent::ToolCalls(_) => None,
-			MessageContent::ToolResponses(_) => None,
-			MessageContent::Blocks(_) => None,
-		}
+	pub fn iter_mut(&mut self) -> IterMut<'_, ContentPart> {
+		self.parts.iter_mut()
 	}
 
-	pub fn tool_calls(&self) -> Option<Vec<&ToolCall>> {
-		match self {
-			MessageContent::ToolCalls(tool_calls) => Some(tool_calls.iter().collect()),
-			_ => None,
-		}
+	/// Return all parts.
+	pub fn parts(&self) -> &Vec<ContentPart> {
+		&self.parts
 	}
 
-	pub fn into_tool_calls(self) -> Option<Vec<ToolCall>> {
-		match self {
-			MessageContent::ToolCalls(tool_calls) => Some(tool_calls),
-			_ => None,
-		}
+	/// Consume and return the underlying parts.
+	pub fn into_parts(self) -> Vec<ContentPart> {
+		self.parts
 	}
 
-	/// Checks if the text content or the tool calls are empty.
+	/// Return all text parts as &str.
+	pub fn texts(&self) -> Vec<&str> {
+		self.parts.iter().filter_map(|p| p.as_text()).collect()
+	}
+
+	/// Consume and return all text parts as owned Strings.
+	pub fn into_texts(self) -> Vec<String> {
+		self.parts.into_iter().filter_map(|p| p.into_text()).collect()
+	}
+
+	pub fn binaries(&self) -> Vec<&Binary> {
+		self.parts.iter().filter_map(|p| p.as_binary()).collect()
+	}
+
+	pub fn into_binaries(self) -> Vec<Binary> {
+		self.parts.into_iter().filter_map(|p| p.into_binary()).collect()
+	}
+
+	/// Return references to all ThoughtSignature parts as &str.
+	pub fn thought_signatures(&self) -> Vec<&str> {
+		self.parts.iter().filter_map(|p| p.as_thought_signature()).collect()
+	}
+
+	/// Consume and return all ThoughtSignature parts as owned Strings.
+	pub fn into_thought_signatures(self) -> Vec<String> {
+		self.parts.into_iter().filter_map(|p| p.into_thought_signature()).collect()
+	}
+
+	/// Return references to all ToolCall parts.
+	pub fn tool_calls(&self) -> Vec<&ToolCall> {
+		self.parts
+			.iter()
+			.filter_map(|p| match p {
+				ContentPart::ToolCall(tc) => Some(tc),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// Consume and return all ToolCall parts.
+	pub fn into_tool_calls(self) -> Vec<ToolCall> {
+		self.parts
+			.into_iter()
+			.filter_map(|p| match p {
+				ContentPart::ToolCall(tc) => Some(tc),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// Return references to all ToolResponse parts.
+	pub fn tool_responses(&self) -> Vec<&ToolResponse> {
+		self.parts
+			.iter()
+			.filter_map(|p| match p {
+				ContentPart::ToolResponse(tr) => Some(tr),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// Consume and return all ToolResponse parts.
+	pub fn into_tool_responses(self) -> Vec<ToolResponse> {
+		self.parts
+			.into_iter()
+			.filter_map(|p| match p {
+				ContentPart::ToolResponse(tr) => Some(tr),
+				_ => None,
+			})
+			.collect()
+	}
+
+	/// Return references to all custom parts.
+	pub fn custom_parts(&self) -> Vec<&CustomPart> {
+		self.parts.iter().filter_map(|p| p.as_custom()).collect()
+	}
+
+	/// Consume and return all custom parts.
+	pub fn into_custom_parts(self) -> Vec<CustomPart> {
+		self.parts.into_iter().filter_map(|p| p.into_custom()).collect()
+	}
+
+	/// True if there are no parts.
 	pub fn is_empty(&self) -> bool {
-		match self {
-			MessageContent::Text(content) => content.is_empty(),
-			MessageContent::Parts(parts) => parts.is_empty(),
-			MessageContent::ToolCalls(tool_calls) => tool_calls.is_empty(),
-			MessageContent::ToolResponses(tool_responses) => tool_responses.is_empty(),
-			MessageContent::Blocks(blocks) => blocks.is_empty(),
+		self.parts.is_empty()
+	}
+
+	/// Number of parts.
+	pub fn len(&self) -> usize {
+		self.parts.len()
+	}
+
+	/// Return references to all ReasoningContent parts as &str.
+	pub fn reasoning_contents(&self) -> Vec<&str> {
+		self.parts.iter().filter_map(|p| p.as_reasoning_content()).collect()
+	}
+
+	/// Consume and return all ReasoningContent parts as owned Strings.
+	pub fn into_reasoning_contents(self) -> Vec<String> {
+		self.parts.into_iter().filter_map(|p| p.into_reasoning_content()).collect()
+	}
+
+	/// Join all reasoning content parts with a newline separator.
+	/// Returns None if there are no reasoning content parts.
+	pub fn joined_reasoning_content(&self) -> Option<String> {
+		let parts = self.reasoning_contents();
+		if parts.is_empty() {
+			return None;
 		}
+		Some(parts.join("\n"))
+	}
+
+	/// True if empty, or if all parts are text whose content is empty or whitespace.
+	pub fn is_text_empty(&self) -> bool {
+		if self.parts.is_empty() {
+			return true;
+		}
+		self.parts
+			.iter()
+			.all(|p| matches!(p, ContentPart::Text(t) if t.trim().is_empty()))
+	}
+}
+
+/// Convenient Getters
+impl MessageContent {
+	/// Return the first text part, if any.
+	///
+	/// Does not concatenate multiple text parts.
+	pub fn first_text(&self) -> Option<&str> {
+		let first_text_part = self.parts.iter().find(|p| p.is_text())?;
+		first_text_part.as_text()
+	}
+
+	/// Consume and return the first text part as a String, if any.
+	///
+	/// Does not concatenate multiple text parts.
+	pub fn into_first_text(self) -> Option<String> {
+		let first_text_part = self.parts.into_iter().find(|p| p.is_text())?;
+		first_text_part.into_text()
+	}
+
+	/// Return the first reasoning content part, if any.
+	///
+	/// Does not concatenate multiple reasoning content parts.
+	pub fn first_reasoning_content(&self) -> Option<&str> {
+		let first_reasoning_part = self.parts.iter().find(|p| p.is_reasoning_content())?;
+		first_reasoning_part.as_reasoning_content()
+	}
+
+	/// Consume and return the first reasoning content part as a String, if any.
+	///
+	/// Does not concatenate multiple reasoning content parts.
+	pub fn into_first_reasoning_content(self) -> Option<String> {
+		let first_reasoning_part = self.parts.into_iter().find(|p| p.is_reasoning_content())?;
+		first_reasoning_part.into_reasoning_content()
+	}
+
+	/// Return the first thought signature part, if any.
+	///
+	/// Does not concatenate multiple thought signature parts.
+	pub fn first_thought_signature(&self) -> Option<&str> {
+		let first_thought_signature_part = self.parts.iter().find(|p| p.is_thought_signature())?;
+		first_thought_signature_part.as_thought_signature()
+	}
+
+	/// Consume and return the first thought signature part as a String, if any.
+	///
+	/// Does not concatenate multiple thought signature parts.
+	pub fn into_first_thought_signature(self) -> Option<String> {
+		let first_thought_signature_part = self.parts.into_iter().find(|p| p.is_thought_signature())?;
+		first_thought_signature_part.into_thought_signature()
+	}
+
+	/// Join all text parts, separating segments with a blank line.
+	pub fn joined_texts(&self) -> Option<String> {
+		let texts = self.texts();
+		if texts.is_empty() {
+			return None;
+		}
+
+		if texts.len() == 1 {
+			return texts.first().map(|s| s.to_string());
+		}
+
+		let mut combined = String::new();
+		for text in texts {
+			support::combine_text_with_empty_line(&mut combined, text);
+		}
+		Some(combined)
+	}
+
+	/// Consume and join all text parts, separating segments with a blank line.
+	pub fn into_joined_texts(self) -> Option<String> {
+		let texts = self.into_texts();
+		if texts.is_empty() {
+			return None;
+		}
+
+		if texts.len() == 1 {
+			return texts.into_iter().next();
+		}
+
+		let mut combined = String::new();
+		for text in texts {
+			support::combine_text_with_empty_line(&mut combined, &text);
+		}
+		Some(combined)
+	}
+}
+
+/// is_.., contains_..
+impl MessageContent {
+	/// True if every part is text.
+	pub fn is_text_only(&self) -> bool {
+		self.parts.iter().all(|p| p.is_text())
+	}
+
+	/// True if at least one part is text.
+	pub fn contains_text(&self) -> bool {
+		self.parts.iter().any(|p| p.is_text())
+	}
+
+	/// True if at least one part is binary.
+	pub fn contains_binary(&self) -> bool {
+		self.parts.iter().any(|p| p.is_binary())
+	}
+
+	/// True if at least one part is a ToolCall.
+	pub fn contains_tool_call(&self) -> bool {
+		self.parts.iter().any(|p| p.is_tool_call())
+	}
+
+	/// True if at least one part is a ToolResponse.
+	pub fn contains_tool_response(&self) -> bool {
+		self.parts.iter().any(|p| p.is_tool_response())
+	}
+
+	/// True if at least one part is a ThoughtSignature.
+	pub fn contains_thought_signature(&self) -> bool {
+		self.parts.iter().any(|p| p.is_thought_signature())
+	}
+
+	/// True if at least one part is ReasoningContent.
+	pub fn contains_reasoning_content(&self) -> bool {
+		self.parts.iter().any(|p| p.is_reasoning_content())
+	}
+
+	/// True if at least one part is Custom.
+	pub fn contains_custom(&self) -> bool {
+		self.parts.iter().any(|p| p.is_custom())
 	}
 }
 
 // region:    --- Froms
 
+impl From<&str> for MessageContent {
+	fn from(s: &str) -> Self {
+		Self {
+			parts: vec![ContentPart::Text(s.to_string())],
+		}
+	}
+}
+
+impl From<&String> for MessageContent {
+	fn from(s: &String) -> Self {
+		Self {
+			parts: vec![ContentPart::Text(s.clone())],
+		}
+	}
+}
+
+impl From<String> for MessageContent {
+	fn from(s: String) -> Self {
+		Self {
+			parts: vec![ContentPart::Text(s)],
+		}
+	}
+}
+
+impl From<Vec<ToolCall>> for MessageContent {
+	fn from(tool_calls: Vec<ToolCall>) -> Self {
+		Self {
+			parts: tool_calls.into_iter().map(ContentPart::ToolCall).collect(),
+		}
+	}
+}
+
+impl From<ToolCall> for MessageContent {
+	fn from(tool_call: ToolCall) -> Self {
+		Self {
+			parts: vec![ContentPart::ToolCall(tool_call)],
+		}
+	}
+}
+
 impl From<ToolResponse> for MessageContent {
 	fn from(tool_response: ToolResponse) -> Self {
-		MessageContent::ToolResponses(vec![tool_response])
+		Self {
+			parts: vec![ContentPart::ToolResponse(tool_response)],
+		}
+	}
+}
+
+impl From<Vec<ToolResponse>> for MessageContent {
+	fn from(tool_responses: Vec<ToolResponse>) -> Self {
+		Self {
+			parts: tool_responses.into_iter().map(ContentPart::ToolResponse).collect(),
+		}
+	}
+}
+
+impl From<ContentPart> for MessageContent {
+	fn from(part: ContentPart) -> Self {
+		Self { parts: vec![part] }
+	}
+}
+
+impl From<Binary> for MessageContent {
+	fn from(bin: Binary) -> Self {
+		Self {
+			parts: vec![bin.into()],
+		}
+	}
+}
+
+impl From<CustomPart> for MessageContent {
+	fn from(custom_part: CustomPart) -> Self {
+		Self {
+			parts: vec![ContentPart::Custom(custom_part)],
+		}
 	}
 }
 
 impl From<Vec<ContentPart>> for MessageContent {
 	fn from(parts: Vec<ContentPart>) -> Self {
-		MessageContent::Parts(parts)
+		Self { parts }
 	}
 }
 
 // endregion: --- Froms
 
-#[derive(Debug, Clone, Serialize, Deserialize, From)]
-pub enum ContentPart {
-	Text(String),
-	Image { content_type: String, source: ImageSource },
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
 
-/// Content blocks for providers that need exact sequence preservation (e.g. Anthropic with thinking)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ContentBlock {
-	/// Text content
-	Text {
-		text: String,
-		/// Optional thought signature for Gemini-style thinking
-		#[serde(skip_serializing_if = "Option::is_none")]
-		thought_signature: Option<String>,
-	},
-	/// Thinking content (Anthropic)
-	Thinking {
-		text: String,
-		/// Signature for maintaining context across turns
-		#[serde(skip_serializing_if = "Option::is_none")]
-		signature: Option<String>,
-	},
-	/// Redacted thinking content (Anthropic) - encrypted/hidden thinking
-	RedactedThinking { data: String },
-	/// Tool use request
-	ToolUse {
-		id: String,
-		name: String,
-		input: Value,
-		/// Optional thought signature for Gemini-style thinking
-		#[serde(skip_serializing_if = "Option::is_none")]
-		thought_signature: Option<String>,
-	},
-	/// Tool result response
-	ToolResult {
-		tool_use_id: String,
-		content: String,
-		/// Whether this tool result represents an error
-		#[serde(skip_serializing_if = "Option::is_none")]
-		is_error: Option<bool>,
-		/// Optional thought signature for Gemini-style thinking
-		#[serde(skip_serializing_if = "Option::is_none")]
-		thought_signature: Option<String>,
-	},
-}
-
-/// Constructors
-impl ContentPart {
-	pub fn from_text(text: impl Into<String>) -> ContentPart {
-		ContentPart::Text(text.into())
+	#[test]
+	fn test_message_content_joined_texts_empty() {
+		assert_eq!(MessageContent::from_parts(vec![]).joined_texts(), None);
 	}
 
-	pub fn from_image_base64(content_type: impl Into<String>, content: impl Into<Arc<str>>) -> ContentPart {
-		ContentPart::Image {
-			content_type: content_type.into(),
-			source: ImageSource::Base64(content.into()),
-		}
+	#[test]
+	fn test_message_content_joined_texts_single_part() {
+		assert_eq!(
+			MessageContent::from_parts(vec![ContentPart::Text("Hello".to_string())]).joined_texts(),
+			Some("Hello".to_string())
+		);
 	}
 
-	pub fn from_image_url(content_type: impl Into<String>, url: impl Into<String>) -> ContentPart {
-		ContentPart::Image {
-			content_type: content_type.into(),
-			source: ImageSource::Url(url.into()),
-		}
+	#[test]
+	fn test_message_content_joined_texts_two_parts() {
+		assert_eq!(
+			MessageContent::from_parts(vec![
+				ContentPart::Text("Hello".to_string()),
+				ContentPart::Text("World".to_string()),
+			])
+			.joined_texts(),
+			Some("Hello\n\nWorld".to_string())
+		);
+	}
+
+	#[test]
+	fn test_message_content_into_joined_texts_empty() {
+		assert_eq!(MessageContent::from_parts(vec![]).into_joined_texts(), None);
+	}
+
+	#[test]
+	fn test_message_content_into_joined_texts_single_part() {
+		assert_eq!(
+			MessageContent::from_parts(vec![ContentPart::Text("Hello".to_string())]).into_joined_texts(),
+			Some("Hello".to_string())
+		);
+	}
+
+	#[test]
+	fn test_message_content_into_joined_texts_two_parts() {
+		assert_eq!(
+			MessageContent::from_parts(vec![
+				ContentPart::Text("Hello".to_string()),
+				ContentPart::Text("World".to_string()),
+			])
+			.into_joined_texts(),
+			Some("Hello\n\nWorld".to_string())
+		);
 	}
 }
-
-// region:    --- Froms
-
-impl<'a> From<&'a str> for ContentPart {
-	fn from(s: &'a str) -> Self {
-		ContentPart::Text(s.to_string())
-	}
-}
-
-// endregion: --- Froms
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ImageSource {
-	/// For models/services that support URL as input
-	/// NOTE: Few AI services support this.
-	Url(String),
-
-	/// The base64 string of the image
-	///
-	/// NOTE: Here we use an Arc<str> to avoid cloning large amounts of data when cloning a ChatRequest.
-	///       The overhead is minimal compared to cloning relatively large data.
-	///       The downside is that it will be an Arc even when used only once, but for this particular data type, the net benefit is positive.
-	Base64(Arc<str>),
-}
-
-// No `Local` location; this would require handling errors like "file not found" etc.
-// Such a file can be easily provided by the user as Base64, and we can implement a convenient
-// TryFrom<File> to Base64 version. All LLMs accept local images only as Base64.

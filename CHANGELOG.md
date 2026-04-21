@@ -1,32 +1,198 @@
-`.` minor | `-` Fix | `+` Addition | `^` improvement | `!` Change | `*` Refactor
+`.` minor | `-` Fix | `+` Addition | `^` improvement | `!` Change | `>` Refactor
 
-## Upcoming - 0.4.0-alpha...
 
-- to be updated
-- `+` API NEW - **Custom http headers** in `ChatOptions` (#78)
-- `+` API NEW - Added `ChatResponse.captured_raw_body` (opt-in via `chat_options.with_capture_raw_body(true)` (PR #68 + refactor)
-- `+` Added Gemini built-in support (PR #67)
-- `+` API NEW - Added web configuration support (#66) (manage proxy, timeout, etc.)
-- `+` Model Namespace Support to force AdapterKind, for example, `openai::codex-...`
-- `+` Added streaming support for tool calls
-- `+` **New Adapters**  Zhipu (ChatGLM) (#76), Nebius
-- `!` API CHANGE - `StreamEnd` - Text and tool calls content are now part of Vec
-- `!` API CHANGE - `ChatResponse::tool_calls(&self) -> Vec<&ToolCall> ` (rather than `Option<Vec..>`)
-- `!` API CHANGE - `ChatResponse.content` now has content `Vec<MessageContent>`
-- `!` API CHANGE - `MessageContent` now use `message_content.text()` and `message_content.into_text()` (rather than text_as_str, text_into_string)
-- `^` API NEW - ChatResponse now implements texts(), into_texts(), first...
-- `^` Anthropic - Added support for ChatResponse multi-content
-- `^` openai - Added support for ChatResponse multi-content
-- `^` gemini - Now uses x-goog-api-key header for auth
-- `-` gemini - Fixed built-in and user tools issue from #67
-- `-` OpenAI - Fixed ServiceTarget issue where custom URL and Auth were not used (PR #71)
-- `-` Fixed: Improved reasoning content extraction in OpenAIAdapter (#69)
-- `-` gemini - Fixed streaming multi-content
-- `-` gemini - Fixed wrong tool_response.content JSON parsing (#59)
-- `-` gemini - Fixed partial message parsing in Gemini stream (#63)
-- `.` openai - added `codex` prefix for Adapter match
-- `.` gemini model names - Updated
-- `.` groq - Updated groq llama models to llama-3.1-8b-instant, llama-3.3-70b-versatile (from deprecation notice)
+## v0.6.0-beta WIP - [v0.6.0-alpha](https://github.com/jeremychone/rust-genai/compare/v0.5.3...HEAD)
+
+
+- `!` API CHANGE - `ContentPart::CustomPart.model_iden` is now `Option`
+- `!` API CHANGE - `all_model_names()` - now live (with AuthResolver support)
+- `!` openai_resp - gate `reasoning.encrypted_content` on `capture_reasoning_content`
+- `!` openai_resp - make `reasoning.summary` opt-in for `capture_reasoning_content`
+- `!` gemini - make `thinkingConfig/includeThoughts` opt-in for `capture_reasoning_content`
+- `!` groq - providers must be addressed via namespaced model (`groq::_model_name`)
+- `+` provider - add Google Vertex adapter with Gemini and Anthropic support
+- `+` anthropic - add JSON schema support
+- `+` API NEW - New `ModelSpec` to define custom endpoint, model, .. 
+- `+` API NEW - add openai resp stateful sessions — `previous_response_id`, `store`, `response_id` (PR #168)
+- `+` API NEW - Add `ContentPart::ReasoningContent` support
+- `+` API NEW - expose provider `stop_reason` in chat responses
+- `+` API NEW - add typed and normalized built-in tools, `ToolName`, `ToolConfig`, `WebSearch`, and related tool support
+- `+` API NEW - WebSearch builtin tool spport for Anthropic, OpenAI, Gemini
+- `+` tests - add yakbak Gemini streaming replay test
+- `+` tests - add yakbak HTTP record/replay integration test infrastructure
+- `+` provider - add Aliyun adapter, namespace only
+- `^` API NEW - chat-level prompt cache `CacheControl` with openai prompt_cache_key Support
+- `^` perf - enable HTTP optimizations, gzip, `TCP_NODELAY`, and HTTP/2 tuning
+- `^` API NEW - Add support for `ReasoningEffort::Max` (Anthropic) and `ReasoningEffort::XHigh` (OpenAI) 
+- `^` ollama - implement native API support (BIG)
+- `^` openai - route GPT-5 models through the OpenAI Responses API
+- `^` openai - now support prompt_cache_key in `ChatOptions` (and `prompt_cache_retention` via `CacheControl`)
+- `^` openai - add request-level prompt cache support and use `instructions` for Responses API system prompts
+- `^` anthropic - add support for adaptive thinking
+- `^` doc - sync llm api reference, spec rules, and tool spec
+- `^` anthropic - emit incremental `ToolCallChunk` events during streaming
+- `-` openai_resp - fix buffering of incomplete UTF-8 sequences across stream chunks
+- `-` openai - capture inline usage from `finish_reason` stream chunks
+- `-` anthropic - guard against null `tool_call` arguments in request serialization
+- `-` anthropic - implement missing prompt caching fixes, cache token capture and normalization, TTL support, and per-part cache control support
+- `-` gemini - support parallel tool calls in streaming adapter
+- `-` openai - fix streamer to emit delta content from `finish_reason` message
+- `-` gemini - fix JSON schema compatibility and usage-only stream tail handling
+- `-` openai - surface SSE error payloads in streaming
+- `-` openai - fix recursive issue on tool handling
+- `-` gemini - fix tool serialization to use `functionDeclarations` camelCase
+- `>` ModelName - add `Static` and `Shared` inner support
+- `>` adapter - update `Adapter` trait with `DEFAULT_API_KEY_ENV_NAME` and update implementations
+- `>` AuthData - add `None` variant
+- `>` openai - relayout adapter implementation and shared code
+- `>` examples - rename examples
+
+## 2026-01-31 - [v0.5.3](https://github.com/jeremychone/rust-genai/compare/v0.5.2...v0.5.3)
+
+- `^` error - add request payload / response body when to chat response fail
+- `>` refactor captured_raw_body into client .exec_chat (prep for #137)
+- `.` tracing - add traced to web-client for ai response (#132)
+- `-` Fix incorrect empty output from MessageContent::joined_texts for ≥ 2 text parts (fixes #135) (#136) Co-authored-by: Ross MacLeod <rmm+github@z.odi.ac>
+- `.` ChatRole - Add PartialEq / Eq (#131)
+
+## 2026-01-27 - [v0.5.2](https://github.com/jeremychone/rust-genai/compare/v0.5.1...v0.5.2)
+
+- `-` Does not capture body when json parse fail  (#128)
+- `^` Anthropic - Add separate reasoning content and thought signature for anthropic messages api (#125)
+- `-` fix - Ollama tool calls are silently swallowed in OpenAI adapter (streaming) (#124)
+- `^` test - ollama - add tool tests
+- `^` gemini - Include thoughts and capture thoughts are reasoning content (#121)
+
+## 2026-01-17 - [v0.5.1](https://github.com/jeremychone/rust-genai/compare/v0.5.0...v0.5.1)
+
+`!` `Error::WebStream` - added error field to preserve original error
+`^` gemini - allow empty tool `thoughtSignature` for Gemini 3 (#115)
+`-` webc - check HTTP status in `WebStream` before processing byte stream (#117)
+`-` client - ensure extra headers are applied in `exec_chat` and `exec_chat_stream` (#116)
+`-` openai_resp - fix assistant message content to use `output_text` (#119)
+
+## 2026-01-09 - [v0.5.0](https://github.com/jeremychone/rust-genai/compare/v0.4.4...v0.5.0)
+
+- `!` zai - change namespace strategy with (zai:: for default, and zai-codding:: for subscription, same Adapter)
+- `+` New Adapter: bigmodel - add back bigmodel.cn and BigModel adapter (only via namespace)
+- `+` MessageContent - Add from ContentPart and Binary
+- `+` New Adatper: : Add MIMO model adapter (#105)
+- `+` gemini adapter - impl thought signature - ThoughtSignature api update
+- `^` anthropic - implemented new output_config.effort for opus-4-5 (matching ReasonningEffort)
+- `^` gemini - for gemini-3, convert ReasoningEffort Low/High to the appropriate gemini thinkingLevel LOW/HIGH, fall back on budget if not gemini 3 or other effort
+- `^` reasoning - add RasoningEffort::None
+- `^` dependency - update to reqwest 0.13
+- `^` MessageContent - add .binaries() and .into_binaries()
+- `^` .size - implement .size in ContentPart and MessageContent
+- `^` ContentPart - Binary from file (as base64)
+- `^` binary - add constructors (from_base64, from_url, from_file)
+- `-` pr-anthropic-tool-fix - #pr 114 - Anthropic ToolCalls with no parameters are not parsed correctly while streaming
+- `-` Fix Gemini adapter to use responseJsonSchema (PR #111)
+- `-` Fix Ollama reasoning streaming (Skip empty reasoning chunks in streaming)
+- `-` Fix Fireworks default depending on streaming (#109)
+- `-` Capture response body in ResponseFailedNotJson error (#103)
+- `>` anthropic - Refactor streamer to use webc::EventSourceStream
+- `>` adapter_openai - switched to custom webc::EventSourceStream based on WebStream
+- `>` webc - remove 'reqwest-eventsource' dependency, all based in same WebStream (EventsourceStream wrapper)
+- `>` ModelName - add namespace_is(..), namespace(), namespace_and_name()
+- `>` binary - refactor openai to use into_url for the base64 url
+- `>` content_part - refactor binary into own file
+
+## 2025-11-14 - [v0.4.4](https://github.com/jeremychone/rust-genai/compare/v0.4.3...v0.4.4)
+
+- `+` openai - adding support for gpt-5-pro (must be mapped to OpenaiResp adapter)
+- `+` Add support for openai audio_type content part for voice agent support. ([PR #96](https://github.com/jeremychone/rust-genai/pull/96) thanks to [Vagmi Mudumbai](https://github.com/vagmi))
+- `+` Add support for OpenAI `service_tier` parameter. ([PR #98](https://github.com/jeremychone/rust-genai/pull/98) thanks to [Himmelschmidt](https://github.com/Himmelschmidt))
+
+
+## 2025-10-25 - [v0.4.3](https://github.com/jeremychone/rust-genai/compare/v0.4.2...v0.4.3)
+
+- `!` Refactor ZHIPU adapter to ZAI with namespace-based endpoint routing (#95)
+- `-` openai - stream tool - Fix streaming too issue (#91)
+- `.` added ModelName partial eq implementations for string types (#94)
+- `.` anthropic - update model name for haiku 4.5
+
+## 2025-10-12 - [v0.4.2](https://github.com/jeremychone/rust-genai/compare/v0.4.1...v0.4.2)
+
+- `.` test - make the common_test_chat_stop_sequences_ok more resilient
+- `^` Anthropic - preserve the content order as it appears in the JSON array (#89)
+- `.` Gemini - when no response, return error with finishReason and usageMetadata
+
+## 2025-09-30 - [v0.4.1](https://github.com/jeremychone/rust-genai/compare/v0.4.0...v0.4.1)
+
+- `^` anthropic - add reasoning support
+
+## 2025-09-28 - [v0.4.0](https://github.com/jeremychone/rust-genai/compare/v0.3.5...v0.4.0)
+
+Some **API Changes** - See [migration-v_0_3_to_0_4](doc/migration/migration-v_0_3_to_0_4.md)
+
+- `+` openai - gpt-5-codex - Add support for gpt-5-codex via Responses OpenAIResp adapter 
+- `!` StreamEnd - now have conent: Option<MessageContent> (but same public api)
+- `!` ChatResponse - now .content: MessageContent (rather than Vec<MessageContent>). Same public interface.
+- `^` chat_stream - Relax Unpin bound in from_inter_stream
+- `^` chat/content_part - trim() in MIME checks, add into_binary(), and struct spacing; update work plan/history
+- `!` ChatRequest::append/with_...(vec) functions  now take iterators
+- `-` ChatRequests::combine_systems - keeping one empty line in between
+- `-` ChatOptions - fix minimal reasoning effort (was matching to low)
+- `+` openai - add verbosity parameter
+- `!` ContentPart - from/new binary now have name last (since optional)
+- `!` ContentPart - Now use ContentPart::Binary(Binary)
+- `!` MessageContent - New structure (flatten multi-part)
+- `.` gemini - update gemini-2.5-flash-lite model name
+- `^` openai - add support for the -minimal suffix
+- `.` test - openai - add gpt-5-mini when possible
+- `.` openai - exclude the 'gpt-oss..' model to allow ollama fallback
+- `>` test - refactoring to TestResult for better test error display
+- `!` API CHAINGE - Now ContentPart::Binary
+- `+` Added support for PDF (and file in general) for openai, anthropic, and gemini
+- `^` fireworks - set the default max_tokens to 256k (won't fail if model lower)
+- `.` openai streamer - check that tool_calls is not null to enter tool_calls (for together streaming)
+- `.` openai streamer - add teogether for capture usage
+- `*` openai streamer - make the content extraction more resilient (do not error or cannot x_take)
+- `+` adapter - add together.ai adapter
+- `+` adapter - add fireworks adapter
+- `+` Add embeddings support (#83)
+- `*` note about AuthData::RequestOverride being only for exec_chat_stream
+- `.` c06-target-resolver - update model
+- `!` Headers - change the API to set / override headers
+- `.` groq - add models
+- `-` gemini - fix -zero,low,... suffix issue
+- `^` Anthropic - Add support for tool calls and thinking in the Anthropic streamer. (#80)
+- `*` Add support for tool calls and thinking in the anthropic streamer.
+- `.` ModelName / ... - add Hash, Eq, PartialEq
+- `+` ChatOptions - Add extra headers to requests (#78)
+- `+` Implement zhipu (ChatGLM) completions  (#76)
+- `+` feat: add new model names to ZhipuAdapter (#77)
+- `.` webc::error ResponseFailedStatus now takes headers: Box HeaderMap
+- `-` fix: handle null tool calls in OpenAIRequestParts parser (#74)
+- `-` fix: push empty content for sglang impl
+- `-` fix: OpenAIAdapter to avoid pushing empty content after reasoning extraction (#72)
+- `-` Fix OpenAIAdapter to avoid pushing empty content after reasoning extraction
+- `-` trim strings too
+- `!` MessageContent - Now use text() and into_text() (from text_as_str, text_into_string)
+- `>` refactor capture_raw_body (from #68) - move it to ChatOptions to be able to override it by chat request
+- `-` feat: support optionally capture raw response body (#68)
+- `-` Extend OpenAI adapter to preserve request params (#71)
+- `+` feat: support embeded tools like gemini's google search (#67)
+- `-` fix: improve reasoning content extraction in OpenAIAdapter (#69)
+- `-` Updated the reasoning content extraction logic to handle cases where reasoning may be present in multiple locations within the response. Enhanced error handling for the extraction process to ensure robustness.
+- `-` feat: add web configuration support (#66)
+- `-` Introduced web_config.rs for web-specific configurations, and updated related modules to integrate web configuration capabilities into the client builder.
+- `-` gemini - fix streaming multi-content
+- `!` api change - StreamEnd - Now text and tool calls content part of Vec
+- `^` Anthropic - add support for ChatResponse multi content (not the stream yet)
+- `^` openai - add support for ChatResponse multi content (not the stream yet)
+- `!` API CHANGE - ChatResponse.tool_calls now return Vec ToolCall
+- `^` ChatResponse - now implements texts(), into_texts(), first...
+- `!` api change - ChatResponse.content now have content Vec MessageContent
+- `-` gemini - fix wrong tool_response.content json parsing (#59)
+- `-` gemini - fix: fixed partial message parsing in Gemini stream (#63)
+- `.` gemini - now use x-goog-api-key header for auth
+- `.` tests - serial for anthropic
+- `!` nebius - remove the model name match for Adapter selection (needs to use namespace)
+- `+` Model Namespace Support
+- `+` add Nebius adapter (#56)
+- `+` Add Tool Use Streaming Support (#58)
 
 ## 2025-05-26 - [v0.3.5](https://github.com/jeremychone/rust-genai/compare/v0.3.4...v0.3.5)
 

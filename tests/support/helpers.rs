@@ -1,6 +1,6 @@
-use super::Result;
+use super::TestResult;
 use bitflags::parser::to_writer;
-use genai::chat::{ChatStream, ChatStreamEvent, StreamEnd};
+use genai::chat::{ChatStream, ChatStreamEvent, StreamEnd, ToolCall};
 use tokio_stream::StreamExt;
 
 /// A macro to retrieve the value of an `Option` field from a struct, returning an error if the field is `None`.
@@ -33,7 +33,7 @@ bitflags::bitflags! {
 	#[derive(Clone)]
 	pub struct Check: u8 {
 		/// Check if the
-		const REASONING       = 0b00000001;
+		const REASONING_CONTENT       = 0b00000001;
 		const REASONING_USAGE = 0b00000010;
 		const USAGE           = 0b00000100;
 	}
@@ -43,7 +43,7 @@ bitflags::bitflags! {
 impl std::fmt::Debug for Check {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		let mut buffer = String::new();
-		to_writer(self, &mut buffer).unwrap();
+		to_writer(self, &mut buffer)?;
 		write!(f, "{buffer}")
 	}
 }
@@ -55,7 +55,7 @@ pub fn contains_checks(checks: Option<Check>, matching_check: Check) -> bool {
 }
 
 // Function to validate flags
-pub fn validate_checks(checks: Option<Check>, valid_flags: Check) -> Result<()> {
+pub fn validate_checks(checks: Option<Check>, valid_flags: Check) -> TestResult<()> {
 	let Some(checks) = checks else { return Ok(()) };
 
 	let unsupported = checks - valid_flags;
@@ -78,20 +78,25 @@ pub struct StreamExtract {
 	pub content: Option<String>,
 
 	pub reasoning_content: Option<String>,
+
+	/// All ToolCallChunk events received during streaming, in order.
+	pub tool_call_chunks: Vec<ToolCall>,
 }
 
-pub async fn extract_stream_end(mut chat_stream: ChatStream) -> Result<StreamExtract> {
+pub async fn extract_stream_end(mut chat_stream: ChatStream) -> TestResult<StreamExtract> {
 	let mut stream_end: Option<StreamEnd> = None;
 
 	let mut content: Vec<String> = Vec::new();
 	let mut reasoning_content: Vec<String> = Vec::new();
+	let mut tool_call_chunks: Vec<ToolCall> = Vec::new();
 
 	while let Some(Ok(stream_event)) = chat_stream.next().await {
 		match stream_event {
 			ChatStreamEvent::Start => (), // nothing to do
 			ChatStreamEvent::Chunk(s_chunk) => content.push(s_chunk.content),
 			ChatStreamEvent::ReasoningChunk(s_chunk) => reasoning_content.push(s_chunk.content),
-			ChatStreamEvent::ToolCallChunk(_) => (), // ignore tool call chunks for now
+			ChatStreamEvent::ThoughtSignatureChunk(_) => (), // ignore thought signature chunks for now
+			ChatStreamEvent::ToolCallChunk(tc) => tool_call_chunks.push(tc.tool_call),
 			ChatStreamEvent::End(s_end) => {
 				stream_end = Some(s_end);
 				break;
@@ -107,6 +112,7 @@ pub async fn extract_stream_end(mut chat_stream: ChatStream) -> Result<StreamExt
 		stream_end,
 		content,
 		reasoning_content,
+		tool_call_chunks,
 	})
 }
 

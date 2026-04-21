@@ -9,19 +9,18 @@ use reqwest::RequestBuilder;
 use serde_json::Value;
 
 pub trait Adapter {
-	// #[deprecated(note = "use default_auth")]
-	// fn default_key_env_name(kind: AdapterKind) -> Option<&'static str>;
+	const DEFAULT_API_KEY_ENV_NAME: Option<&'static str>;
 
 	fn default_auth() -> AuthData;
 
 	fn default_endpoint() -> Endpoint;
 
 	// NOTE: Adapter is a crate trait, so it is acceptable to use async fn here.
-	async fn all_model_names(kind: AdapterKind) -> Result<Vec<String>>;
+	async fn all_model_names(kind: AdapterKind, endpoint: Endpoint, auth: AuthData) -> Result<Vec<String>>;
 
 	/// The base service URL for this AdapterKind for the given service type.
 	/// NOTE: For some services, the URL will be further updated in the to_web_request_data method.
-	fn get_service_url(model_iden: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> String;
+	fn get_service_url(model_iden: &ModelIden, service_type: ServiceType, endpoint: Endpoint) -> Result<String>;
 
 	/// To be implemented by Adapters.
 	fn to_web_request_data(

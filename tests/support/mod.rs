@@ -9,13 +9,14 @@ mod asserts;
 mod data;
 mod helpers;
 mod seeders;
+mod test_error;
+pub mod yakbak;
 
 pub use asserts::*;
 pub use helpers::*;
 pub use seeders::*;
+pub use test_error::*;
 
 pub mod common_tests;
-
-pub type Result<T> = core::result::Result<T, Box<dyn std::error::Error>>;
 
 // endregion: --- Modules

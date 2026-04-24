@@ -1,6 +1,6 @@
 use crate::adapter::AdapterKind;
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
-use crate::chat::{ChatMessage, ContentPart, MessageContent, StopReason, ThinkingBlock, ToolCall, Usage};
+use crate::chat::{ChatMessage, ContentPart, MessageContent, StopReason, ToolCall, Usage};
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
@@ -133,19 +133,40 @@ impl From<InterStreamEnd> for StreamEnd {
 		// Ordering policy: ThinkingBlock -> Text -> ToolCall
 		// This matches provider expectations (e.g., Gemini, Anthropic require thinking first).
 		let mut captured_content: Option<MessageContent> = None;
-		if let Some((captured_sigs, provenance)) = inter_end.captured_thought_signatures {
-			let thoughts_content = captured_sigs
+		if let Some((captured_blocks, provenance)) = inter_end.captured_thought_blocks {
+			// Canonical path (Anthropic-shaped): each captured block is a first-class
+			// ContentPart::ThinkingBlock in the message content, carrying its own text
+			// paired with its own signature. Anthropic's server validates signatures
+			// byte-exact against the paired thinking text, so preserving the per-block
+			// pairing here is load-bearing — scrambling text↔sig invalidates signatures
+			// and breaks multi-turn thinking / signed replay.
+			let thoughts_content = captured_blocks
 				.iter()
-				.map(|sig| ContentPart::ThinkingBlock(ThinkingBlock::signed(provenance, "", sig.clone())))
+				.cloned()
+				.map(ContentPart::ThinkingBlock)
 				.collect::<Vec<_>>();
-			// Also attach thoughts to the first tool call so that
-			// ChatMessage::from(Vec<ToolCall>) can auto-prepend them.
+
+			// Gemini-shaped backfill: Gemini's wire format attaches signatures directly
+			// to functionCall Parts as opaque tokens with no paired thinking text. The
+			// `ToolCall.thought_signatures` field models that semantic — a Vec<String>
+			// of opaque signatures hanging off a tool call. This backfill supports
+			// consumers that use `ChatMessage::from(Vec<ToolCall>)` auto-prepend, which
+			// is Gemini-specific; Anthropic consumers should read `captured_content`
+			// directly (where per-block text is preserved). The mapping drops text
+			// here because Gemini has none to preserve.
 			if let Some(tool_calls) = captured_tool_calls.as_mut()
 				&& let Some(first_call) = tool_calls.first_mut()
 			{
-				first_call.thought_signatures = Some(captured_sigs);
-				first_call.thought_signatures_provenance = Some(provenance);
+				let sigs: Vec<String> = captured_blocks
+					.iter()
+					.filter_map(|b| b.signature.clone())
+					.collect();
+				if !sigs.is_empty() {
+					first_call.thought_signatures = Some(sigs);
+					first_call.thought_signatures_provenance = Some(provenance);
+				}
 			}
+
 			if let Some(existing_content) = &mut captured_content {
 				existing_content.extend_front(thoughts_content);
 			} else {
@@ -220,7 +241,11 @@ impl StreamEnd {
 		Some(captured_content.into_tool_calls())
 	}
 
-	/// Returns all captured thought signatures, if any.
+	/// Returns all captured thought signatures, if any. Convenience accessor
+	/// that extracts just the signature strings from captured thinking blocks —
+	/// the per-block text is discarded. Callers that need the full thinking
+	/// blocks (with text) should iterate `captured_content.parts()` and filter
+	/// on `ContentPart::ThinkingBlock` directly.
 	pub fn captured_thought_signatures(&self) -> Option<Vec<&str>> {
 		let captured_content = self.captured_content.as_ref()?;
 		Some(

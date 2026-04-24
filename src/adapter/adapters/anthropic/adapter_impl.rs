@@ -704,25 +704,18 @@ impl AnthropicAdapter {
 				// Assistant can mix text, thinking, and tool_use entries.
 				ChatRole::Assistant => {
 					let mut values: Vec<Value> = Vec::new();
+					let mut thinking_blocks: Vec<Value> = Vec::new();
 					let mut has_tool_use = false;
 					let mut has_text = false;
 
-					// Collect thought signatures and reasoning content separately so
-					// we can pair them into signed thinking blocks for the wire format.
-					// Anthropic requires each thinking block to carry the original signed
-					// text (`thinking`) alongside the opaque `signature` it issued.
+					// Walk parts in order. Thinking blocks are emitted 1:1 — each
+					// ContentPart::ThinkingBlock produces one outbound `thinking` entry
+					// carrying its own text paired with its own signature. Anthropic
+					// validates signatures byte-exact against the paired `thinking`
+					// text, so any text↔signature scrambling invalidates the signature.
 					//
-					// Pairing strategy: zip signatures with reasoning chunks by index.
-					// The first signature is paired with all concatenated reasoning text;
-					// any additional signatures (from multiple thinking blocks in a single
-					// turn) are emitted with an empty `thinking` field. This is lossless
-					// for the common single-block case and makes a best-effort attempt for
-					// multi-block interleaved thinking where per-block text was merged.
-					let mut thought_signatures: Vec<String> = Vec::new();
-					let mut reasoning_texts: Vec<String> = Vec::new();
-
-					// First pass: collect thinking-related parts and build non-thinking
-					// content blocks in the order they appear.
+					// Non-Anthropic-provenance blocks are dropped: their signatures were
+					// issued by another provider and Anthropic cannot verify them.
 					for part in msg.content {
 						match part {
 							ContentPart::Text(text) => {
@@ -748,17 +741,16 @@ impl AnthropicAdapter {
 								}));
 							}
 							ContentPart::ThinkingBlock(block) => {
-								// Only include thinking blocks that originated from Anthropic.
-								// Blocks from other providers carry signatures that Anthropic
-								// cannot verify, so they must be dropped to avoid wire errors.
-								if block.provenance == AdapterKind::Anthropic {
-									if let Some(sig) = block.signature {
-										thought_signatures.push(sig);
-									}
-									if let Some(text) = block.text {
-										reasoning_texts.push(text);
-									}
+								if block.provenance != AdapterKind::Anthropic {
+									continue;
 								}
+								let Some(sig) = block.signature else { continue };
+								let text = block.text.unwrap_or_default();
+								thinking_blocks.push(json!({
+									"type": "thinking",
+									"thinking": text,
+									"signature": sig,
+								}));
 							}
 							// Unsupported for assistant role in Anthropic message content
 							ContentPart::Binary(_) => {}
@@ -768,31 +760,8 @@ impl AnthropicAdapter {
 						}
 					}
 
-					// Build signed thinking blocks and prepend them before other content.
 					// Anthropic requires thinking blocks to appear before tool_use blocks.
-					if !thought_signatures.is_empty() {
-						// Combine all reasoning text into one string; for single-block
-						// responses (the common case) this is the exact original text.
-						let combined_reasoning = reasoning_texts.join("");
-						let mut thinking_blocks: Vec<Value> = thought_signatures
-							.into_iter()
-							.enumerate()
-							.map(|(i, sig)| {
-								// Assign the full reasoning text to the first block; subsequent
-								// blocks from multi-block interleaved thinking get an empty string
-								// because the per-block text was merged on the inbound path.
-								let thinking_text = if i == 0 {
-									combined_reasoning.clone()
-								} else {
-									String::new()
-								};
-								json!({
-									"type": "thinking",
-									"thinking": thinking_text,
-									"signature": sig,
-								})
-							})
-							.collect();
+					if !thinking_blocks.is_empty() {
 						thinking_blocks.extend(values);
 						values = thinking_blocks;
 					}
@@ -1483,19 +1452,24 @@ mod tests {
 	}
 
 	/// Verify that multiple thinking blocks from a single turn are each emitted as
-	/// separate `{"type": "thinking", ...}` blocks on the outbound wire. For the
-	/// multi-block case, the full reasoning text is assigned to the first signature;
-	/// subsequent signatures get empty thinking text (best-effort, since the per-block
-	/// text is merged on the inbound streaming path).
+	/// separate `{"type": "thinking", ...}` blocks on the outbound wire, with
+	/// per-block text and signature preserved 1:1.
+	///
+	/// This is load-bearing for Anthropic signature validation: the server
+	/// validates each signature byte-exact against its paired `thinking` text.
+	/// Concatenating all text into block[0] and leaving block[1..] empty —
+	/// the previous best-effort behaviour — scrambles the pairing so all
+	/// signatures become invalid, making multi-turn thinking unusable.
 	#[test]
-	fn test_multiple_thinking_blocks_are_emitted_separately() {
-		let sig1 = "sig-FIRST-0001";
-		let sig2 = "sig-SECOND-0002";
-		let combined_reasoning = "block one text block two text";
+	fn test_multiple_thinking_blocks_preserve_per_block_text_pairing() {
+		let text0 = "block one text";
+		let sig0 = "sig-FIRST-0001";
+		let text1 = "block two text";
+		let sig1 = "sig-SECOND-0002";
 
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![
-			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, combined_reasoning, sig1)),
-			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, "", sig2)),
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, text0, sig0)),
+			ContentPart::ThinkingBlock(ThinkingBlock::signed(AdapterKind::Anthropic, text1, sig1)),
 			ContentPart::ToolCall(ToolCall {
 				call_id: "toolu_multi".to_string(),
 				fn_name: "search".to_string(),
@@ -1527,21 +1501,19 @@ mod tests {
 
 		assert_eq!(thinking_blocks.len(), 2, "must have exactly 2 thinking blocks");
 
-		// First block gets the combined reasoning text.
 		assert_eq!(
 			thinking_blocks[0].get("thinking").and_then(|v| v.as_str()),
-			Some(combined_reasoning),
-			"first thinking block must carry the combined reasoning text"
+			Some(text0),
+			"block 0 text must match input verbatim (NOT concatenated)"
 		);
-		assert_eq!(thinking_blocks[0].get("signature").and_then(|v| v.as_str()), Some(sig1),);
+		assert_eq!(thinking_blocks[0].get("signature").and_then(|v| v.as_str()), Some(sig0));
 
-		// Second block gets an empty thinking field (merged-text limitation).
 		assert_eq!(
 			thinking_blocks[1].get("thinking").and_then(|v| v.as_str()),
-			Some(""),
-			"second thinking block must have empty thinking field (merged-text limitation)"
+			Some(text1),
+			"block 1 text must match input verbatim (NOT empty)"
 		);
-		assert_eq!(thinking_blocks[1].get("signature").and_then(|v| v.as_str()), Some(sig2),);
+		assert_eq!(thinking_blocks[1].get("signature").and_then(|v| v.as_str()), Some(sig1));
 	}
 
 	/// Regression guard: the non-streaming (`to_chat_response`) path must capture both

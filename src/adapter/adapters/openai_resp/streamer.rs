@@ -215,7 +215,12 @@ impl futures::Stream for OpenAIRespStreamer {
 									}
 								}
 								for sig in thought_sigs {
-									self.captured_data.push_thought_signature(sig, AdapterKind::OpenAI);
+									// OpenAI Responses API `encrypted_content` is opaque and has
+									// no paired thinking text on this path. Store empty text so
+									// the round-trip type matches; OpenAI's outbound path does not
+									// require paired text.
+									self.captured_data
+										.push_thought_block(String::new(), sig, AdapterKind::OpenAI);
 								}
 							}
 
@@ -225,7 +230,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: self.captured_data.take_thought_signatures(),
+								captured_thought_blocks: self.captured_data.take_thought_blocks(),
 								captured_response_id: Some(response.id),
 							};
 
@@ -258,7 +263,7 @@ impl futures::Stream for OpenAIRespStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: None,
+								captured_thought_blocks: None,
 								captured_response_id: Some(resp_id),
 							};
 
@@ -287,7 +292,7 @@ impl futures::Stream for OpenAIRespStreamer {
 							captured_text_content: self.captured_data.content.take(),
 							captured_reasoning_content: self.captured_data.reasoning_content.take(),
 							captured_tool_calls: self.captured_data.tool_calls.take(),
-							captured_thought_signatures: None,
+							captured_thought_blocks: None,
 							captured_response_id: None,
 						};
 						return Poll::Ready(Some(Ok(InterStreamEvent::End(inter_stream_end))));

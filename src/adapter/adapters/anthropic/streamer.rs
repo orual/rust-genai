@@ -225,18 +225,21 @@ impl futures::Stream for AnthropicStreamer {
 									}
 								}
 								InProgressBlock::Thinking { reasoning, signature } => {
-									// Capture the signature for this thinking block so the adapter
-									// can reconstruct signed thinking blocks on the next turn.
+									// Capture the per-block (text, signature) pair so the adapter
+									// can reconstruct signed thinking blocks on the next turn with
+									// their original text intact. Anthropic validates signatures
+									// byte-exact against the paired thinking text; any scrambling
+									// of the text↔sig pairing invalidates the signature.
+									//
 									// We capture whenever we have a signature, regardless of other
 									// capture flags, because signature capture is necessary for
-									// continued thinking across tool-use cycles.
+									// continued thinking across tool-use cycles. The combined
+									// reasoning_content string (for UX display) is still accumulated
+									// separately during content_block_delta.
 									if let Some(sig) = signature {
-										self.captured_data.push_thought_signature(sig, AdapterKind::Anthropic);
+										self.captured_data
+											.push_thought_block(reasoning, sig, AdapterKind::Anthropic);
 									}
-									// The per-block reasoning text has already been accumulated
-									// into captured_data.reasoning_content during content_block_delta.
-									// We drop the per-block copy here; the combined string is kept.
-									let _ = reasoning;
 								}
 								InProgressBlock::Text => {
 									// no-op for text blocks
@@ -276,7 +279,7 @@ impl futures::Stream for AnthropicStreamer {
 								// Populate with the per-block signatures accumulated during the stream.
 								// These are used by the adapter to reconstruct signed thinking blocks
 								// on the follow-up request so the model can continue its reasoning chain.
-								captured_thought_signatures: self.captured_data.take_thought_signatures(),
+								captured_thought_blocks: self.captured_data.take_thought_blocks(),
 								captured_response_id: None,
 							};
 

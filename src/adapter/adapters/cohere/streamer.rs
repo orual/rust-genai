@@ -117,7 +117,7 @@ impl futures::Stream for CohereStreamer {
 										captured_text_content: self.captured_data.content.take(),
 										captured_reasoning_content: self.captured_data.reasoning_content.take(),
 										captured_tool_calls: self.captured_data.tool_calls.take(),
-										captured_thought_signatures: None,
+										captured_thought_blocks: None,
 										captured_response_id: None,
 									};
 

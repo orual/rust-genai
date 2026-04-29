@@ -3,7 +3,7 @@
 
 use crate::ModelIden;
 use crate::adapter::AdapterKind;
-use crate::chat::{ChatOptionsSet, Usage};
+use crate::chat::{ChatOptionsSet, ThinkingBlock, Usage};
 use crate::resolver::AuthData;
 use crate::{Error, Result};
 
@@ -48,27 +48,35 @@ pub struct StreamerCapturedData {
 	pub content: Option<String>,
 	pub reasoning_content: Option<String>,
 	pub tool_calls: Option<Vec<crate::chat::ToolCall>>,
-	pub thought_signatures: Option<Vec<String>>,
+	/// Per-block thinking payloads (text + signature) captured across the stream.
+	/// Elements pair with their originating content block 1:1 so that Anthropic's
+	/// byte-exact signature validation holds on replay.
+	pub thought_blocks: Option<Vec<ThinkingBlock>>,
 	pub thought_signatures_provenance: Option<AdapterKind>,
 }
 
 impl StreamerCapturedData {
-	/// Append a thought signature and record its provenance.
+	/// Append a thought block (per-block text paired with its signature) and
+	/// record its provenance. The pairing must be preserved through reconstruction
+	/// and outbound replay — Anthropic validates signatures byte-exact against
+	/// the paired thinking text.
 	///
-	/// All signatures on a single stream are expected to come from the same adapter;
+	/// All blocks on a single stream are expected to come from the same adapter;
 	/// the provenance is set on the first call and then verified (mismatches are silently
 	/// overwritten in favour of the latest, which should never happen in practice).
-	pub fn push_thought_signature(&mut self, sig: String, provenance: AdapterKind) {
-		self.thought_signatures.get_or_insert_with(Vec::new).push(sig);
+	pub fn push_thought_block(&mut self, text: String, sig: String, provenance: AdapterKind) {
+		self.thought_blocks
+			.get_or_insert_with(Vec::new)
+			.push(ThinkingBlock::signed(provenance, text, sig));
 		self.thought_signatures_provenance = Some(provenance);
 	}
 
-	/// Drain accumulated thought signatures and their provenance, returning them as a
-	/// tuple ready to be stored in `InterStreamEnd::captured_thought_signatures`.
-	pub fn take_thought_signatures(&mut self) -> Option<(Vec<String>, AdapterKind)> {
-		let sigs = self.thought_signatures.take()?;
+	/// Drain accumulated thought blocks and their provenance, returning them as a
+	/// tuple ready to be stored in `InterStreamEnd::captured_thought_blocks`.
+	pub fn take_thought_blocks(&mut self) -> Option<(Vec<ThinkingBlock>, AdapterKind)> {
+		let blocks = self.thought_blocks.take()?;
 		let provenance = self.thought_signatures_provenance.take().unwrap_or(AdapterKind::Anthropic);
-		Some((sigs, provenance))
+		Some((blocks, provenance))
 	}
 }
 

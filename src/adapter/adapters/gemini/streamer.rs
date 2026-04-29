@@ -66,7 +66,7 @@ impl futures::Stream for GeminiStreamer {
 								captured_text_content: self.captured_data.content.take(),
 								captured_reasoning_content: self.captured_data.reasoning_content.take(),
 								captured_tool_calls: self.captured_data.tool_calls.take(),
-								captured_thought_signatures: self.captured_data.take_thought_signatures(),
+								captured_thought_blocks: self.captured_data.take_thought_blocks(),
 								captured_response_id: None,
 							};
 
@@ -137,8 +137,12 @@ impl futures::Stream for GeminiStreamer {
 
 							// 1. Thought
 							if let Some(thought) = stream_thought {
-								// Capture thought with Gemini provenance.
-								self.captured_data.push_thought_signature(thought.clone(), AdapterKind::Gemini);
+								// Gemini does not expose per-block thinking text through this
+								// stream shape — only the opaque signature. Store empty text so
+								// the round-trip type matches; Gemini's wire format does not
+								// carry thinking text back to the model anyway.
+								self.captured_data
+									.push_thought_block(String::new(), thought.clone(), AdapterKind::Gemini);
 
 								if self.options.capture_usage {
 									self.captured_data.usage = Some(usage.clone());

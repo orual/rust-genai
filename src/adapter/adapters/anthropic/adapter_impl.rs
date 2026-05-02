@@ -246,10 +246,6 @@ impl Adapter for AnthropicAdapter {
 
 		// -- url
 		let url = Self::get_service_url(&model, service_type, endpoint)?;
-
-		// -- Detect OAuth by checking if api_key starts with "Bearer "
-		let is_oauth = api_key.starts_with("Bearer ");
-
 		// -- headers
 		let headers = Headers::from(vec![
 			("x-api-key".to_string(), api_key),
@@ -261,7 +257,7 @@ impl Adapter for AnthropicAdapter {
 			system,
 			messages,
 			tools,
-		} = Self::into_anthropic_request_parts(chat_req, is_oauth, thinking_enabled)?;
+		} = Self::into_anthropic_request_parts(chat_req)?;
 
 		// -- Extract Model Name and Reasoning
 		let (_, raw_model_name) = model.model_name.namespace_and_name();
@@ -355,54 +351,8 @@ impl Adapter for AnthropicAdapter {
 		let max_tokens = Self::resolve_max_tokens(model_name, &options_set);
 		payload.x_insert("max_tokens", max_tokens)?; // required for Anthropic
 
-		// -- Add thinking configuration if enabled
-		if thinking_enabled {
-			// Convert reasoning effort to budget tokens
-			let budget_tokens = match options_set.reasoning_effort() {
-				Some(ReasoningEffort::Low) => 4096,     // 4k tokens
-				Some(ReasoningEffort::Medium) => 16384, // 16k tokens (recommended starting point)
-				Some(ReasoningEffort::High) => 32768,   // 32k tokens
-				Some(ReasoningEffort::Budget(b)) => *b as u32,
-				None => 16384, // Default to medium if thinking is enabled
-			};
-
-			// Ensure budget is at least 1024 (Anthropic minimum)
-			let budget_tokens = budget_tokens.max(1024);
-
-			// Ensure budget is less than max_tokens
-			let budget_tokens = budget_tokens.min(max_tokens.saturating_sub(100));
-
-			let thinking = json!({
-				"type": "enabled",
-				"budget_tokens": budget_tokens
-			});
-			payload.x_insert("thinking", thinking)?;
-		}
-
-		// -- Add other supported ChatOptions
-		// Temperature cannot be set when thinking is enabled
-		if !thinking_enabled {
-			if let Some(temperature) = options_set.temperature() {
-				payload.x_insert("temperature", temperature)?;
-			}
-		}
-
-		if !options_set.stop_sequences().is_empty() {
-			payload.x_insert("stop_sequences", options_set.stop_sequences())?;
-		}
-
-		// top_p restrictions when thinking is enabled
 		if let Some(top_p) = options_set.top_p() {
-			if thinking_enabled {
-				// When thinking is enabled, top_p must be between 0.95 and 1
-				if top_p >= 0.95 && top_p <= 1.0 {
-					payload.x_insert("top_p", top_p)?;
-				}
-				// Otherwise skip setting top_p
-			} else {
-				// Normal top_p when thinking is disabled
-				payload.x_insert("top_p", top_p)?;
-			}
+			payload.x_insert("top_p", top_p)?;
 		}
 
 		Ok(WebRequestData { url, headers, payload })
@@ -614,7 +564,7 @@ impl AnthropicAdapter {
 
 	/// Takes the GenAI ChatMessages and constructs the System string and JSON Messages for Anthropic.
 	/// - Will push the `ChatRequest.system` and system message to `AnthropicRequestParts.system`
-	pub(in crate::adapter) fn into_anthropic_request_parts(chat_req: ChatRequest) -> Result<AnthropicRequestParts> {
+	pub fn into_anthropic_request_parts(chat_req: ChatRequest) -> Result<AnthropicRequestParts> {
 		let mut messages: Vec<Value> = Vec::new();
 		// (content, cache_control)
 		let mut systems: Vec<(String, Option<CacheControl>)> = Vec::new();
@@ -850,7 +800,6 @@ impl AnthropicAdapter {
 		}
 
 		// -- Create the Anthropic system
-		// NOTE: Anthropic does not have a "role": "system", just a single optional system property
 		let system = if let Some(blocks) = explicit_system_blocks {
 			// Explicit `system_blocks` path: always emit array shape, honouring
 			// each block's cache_control verbatim. Empty vec → no system at all
@@ -887,36 +836,12 @@ impl AnthropicAdapter {
 					.collect();
 				json!(parts)
 			} else {
-				// Non-OAuth uses existing logic
-				let mut last_cache_idx = -1;
-				// first determine the last cache control index
-				for (idx, (_, is_cache_control)) in systems.iter().enumerate() {
-					if *is_cache_control {
-						last_cache_idx = idx as i32;
-					}
-				}
-				// Now build the system multi part
-				let system: Value = if last_cache_idx > 0 {
-					let mut parts: Vec<Value> = Vec::new();
-					for (idx, (content, _)) in systems.iter().enumerate() {
-						let idx = idx as i32;
-						if idx == last_cache_idx {
-							let part = json!({"type": "text", "text": content, "cache_control": {"type": "ephemeral", "ttl": "1h"}});
-							parts.push(part);
-						} else {
-							let part = json!({"type": "text", "text": content});
-							parts.push(part);
-						}
-					}
-					json!(parts)
-				} else {
-					let content_buff = systems.iter().map(|(content, _)| content.as_str()).collect::<Vec<&str>>();
-					// we add empty line in between each system
-					let content = content_buff.join("\n\n");
-					json!(content)
-				};
-				Some(system)
-			}
+				let content_buff = systems.iter().map(|(content, _)| content.as_str()).collect::<Vec<&str>>();
+				// we add empty line in between each system
+				let content = content_buff.join("\n\n");
+				json!(content)
+			};
+			Some(system)
 		} else {
 			None
 		};
@@ -932,10 +857,6 @@ impl AnthropicAdapter {
 					.collect::<Result<Vec<Value>>>()
 			})
 			.transpose()?;
-
-		if let Some(tool) = tools.as_mut().and_then(|t| t.last_mut()).and_then(|t| t.as_object_mut()) {
-			tool.insert("cache_control".to_string(), json!({"type": "ephemeral", "ttl": "1h"}));
-		}
 
 		Ok(AnthropicRequestParts {
 			system,
@@ -1084,7 +1005,18 @@ fn apply_cache_control_to_parts(cache_control: Option<&CacheControl>, parts: Vec
 	parts
 }
 
-pub(in crate::adapter) struct AnthropicRequestParts {
+/// Anthropic-wire-shape request parts produced by
+/// [`AnthropicAdapter::into_anthropic_request_parts`]. Each `Value` is a
+/// `serde_json::Value` ready to splice into a `/v1/messages` or
+/// `/v1/messages/count_tokens` body.
+///
+/// **Why this is `pub`:** the count_tokens endpoint expects the same wire
+/// shape as `/v1/messages`, including the `ChatRole::Tool → user-with-tool_result`
+/// transformation. Exposing this lets callers (e.g. `pattern_provider::token_count`)
+/// reuse the same conversion path instead of re-emitting messages via
+/// `serde_json::to_string` on `ChatMessage`, which would surface raw role
+/// names (`"tool"`) the count_tokens endpoint rejects.
+pub struct AnthropicRequestParts {
 	pub system: Option<Value>,
 	pub messages: Vec<Value>,
 	pub tools: Option<Vec<Value>>,

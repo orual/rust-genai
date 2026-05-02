@@ -194,7 +194,23 @@ impl From<CacheControl> for MessageOptions {
 // region:    --- ChatRole
 
 /// Chat roles recognized across providers.
+///
+/// Serde serializes to the canonical wire form used by every supported
+/// provider (`"system"`, `"user"`, `"assistant"`, `"tool"`). Without
+/// `rename_all = "lowercase"`, the derive would emit capitalised
+/// variant names — fine inside Rust but rejected by the Anthropic
+/// `/v1/messages` and `/v1/messages/count_tokens` endpoints, which
+/// only accept lowercase. Provider-specific adapters that build
+/// request bodies via `json!({"role": "user", ...})` happen to bypass
+/// this serialization, but any caller that drops a `ChatMessage`
+/// straight into `serde_json::to_string` (e.g. pattern_provider's
+/// `CountTokensRequest`) needs the lowercase form.
+///
+/// `Display` (via `derive_more::Display`) still renders the
+/// capitalised form for log lines / debug output where a human-
+/// readable label is the goal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, derive_more::Display)]
+#[serde(rename_all = "lowercase")]
 #[allow(missing_docs)]
 pub enum ChatRole {
 	System,

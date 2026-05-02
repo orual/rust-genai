@@ -22,6 +22,12 @@ pub(crate) use dispatcher::*;
 
 pub use adapter_kind::*;
 
+// Re-export the Anthropic adapter's wire-conversion entry point so external
+// crates can produce request bodies in the exact shape Anthropic expects
+// (e.g. for the `/v1/messages/count_tokens` endpoint, which shares the wire
+// shape with `/v1/messages`). See `AnthropicRequestParts` doc for rationale.
+pub use adapters::anthropic::{AnthropicAdapter, AnthropicRequestParts};
+
 // -- Crate modules
 pub(crate) mod inter_stream;
 

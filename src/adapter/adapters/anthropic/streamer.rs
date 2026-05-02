@@ -22,6 +22,7 @@ pub struct AnthropicStreamer {
 	in_progress_block: InProgressBlock,
 }
 
+#[allow(dead_code)]
 enum InProgressBlock {
 	Text,
 	ToolUse {
@@ -35,6 +36,9 @@ enum InProgressBlock {
 	/// with the block's reasoning text when we capture it at `content_block_stop`.
 	Thinking {
 		reasoning: String,
+		signature: Option<String>,
+	},
+	RedactedThinking {
 		signature: Option<String>,
 	},
 }
@@ -241,12 +245,16 @@ impl futures::Stream for AnthropicStreamer {
 									// reasoning_content string (for UX display) is still accumulated
 									// separately during content_block_delta.
 									if let Some(sig) = signature {
-										self.captured_data
-											.push_thought_block(reasoning, sig, AdapterKind::Anthropic);
+										self.captured_data.push_thought_block(reasoning, sig, AdapterKind::Anthropic);
 									}
 								}
 								InProgressBlock::Text => {
 									// no-op for text blocks
+								}
+								InProgressBlock::RedactedThinking { signature } => {
+									if let Some(sig) = signature {
+										self.captured_data.push_thought_block("".into(), sig, AdapterKind::Anthropic);
+									}
 								}
 							}
 

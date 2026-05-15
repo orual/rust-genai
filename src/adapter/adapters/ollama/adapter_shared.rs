@@ -2,7 +2,7 @@
 
 use crate::Headers;
 use crate::adapter::AdapterKind;
-use crate::adapter::adapters::support::content_as_string;
+use crate::adapter::adapters::support::tool_response_parts_as_string;
 use crate::adapter::ollama::OllamaAdapter;
 use crate::chat::{Binary, BinarySource, ChatRequest, ContentPart, Tool, ToolName, Usage};
 use crate::resolver::Endpoint;
@@ -102,7 +102,7 @@ impl OllamaAdapter {
 						// Note: Ollama native API expects role "tool" for tool response.
 						// Stringify structured values (e.g. Anthropic nested block arrays)
 						// since Ollama requires a flat string in the `content` field.
-						ollama_msg.x_insert("content", content_as_string(&tr.content))?;
+						ollama_msg.x_insert("content", tool_response_parts_as_string(&tr.content))?;
 					}
 					_ => {}
 				}

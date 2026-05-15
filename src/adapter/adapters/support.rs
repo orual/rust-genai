@@ -84,18 +84,33 @@ impl StreamerCapturedData {
 
 // region:    --- Tool Content Helpers
 
-/// Return a tool response content value as a flat string.
+/// Flatten a tool response's Vec<ContentPart> to a plain string.
 ///
-/// Providers that require plain-string tool content (OpenAI, Gemini, Ollama)
-/// use this helper. A `Value::String` is returned verbatim; any other JSON
-/// shape is serialized to its compact JSON string representation. This is a
-/// lossless fallback — structured content (e.g. Anthropic nested block arrays)
-/// round-trips through JSON rather than being silently dropped.
-pub fn content_as_string(content: &serde_json::Value) -> String {
-	match content {
-		serde_json::Value::String(s) => s.clone(),
-		other => other.to_string(),
+/// Used by adapters whose tool-result content field is string-only (OpenAI Chat
+/// Completions legacy API; Gemini 2.x; Ollama; Cohere) or as a temporary bridge
+/// while per-adapter multi-modal serialization is being implemented.
+///
+/// - Text parts are joined with newlines.
+/// - Binary parts are replaced with [attachment: name-or-content-type] placeholders.
+/// - Other ContentPart variants (ToolCall, ToolResponse, ThinkingBlock, Custom)
+///   are not semantically meaningful inside a tool result and are dropped silently.
+pub fn tool_response_parts_as_string(parts: &[crate::chat::ContentPart]) -> String {
+	use crate::chat::ContentPart;
+	let mut buf: Vec<String> = Vec::new();
+	for part in parts {
+		match part {
+			ContentPart::Text(s) => buf.push(s.clone()),
+			ContentPart::Binary(b) => {
+				let label = b.name.clone().unwrap_or_else(|| b.content_type.clone());
+				buf.push(format!("[attachment: {label}]"));
+			}
+			ContentPart::ToolCall(_)
+			| ContentPart::ToolResponse(_)
+			| ContentPart::ThinkingBlock(_)
+			| ContentPart::Custom(_) => {}
+		}
 	}
+	buf.join("\n")
 }
 
 // endregion: --- Tool Content Helpers

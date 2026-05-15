@@ -1,4 +1,4 @@
-use crate::adapter::adapters::support::{content_as_string, get_api_key};
+use crate::adapter::adapters::support::get_api_key;
 use crate::adapter::gemini::GeminiStreamer;
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
@@ -661,15 +661,10 @@ impl GeminiAdapter {
 								}));
 							}
 							ContentPart::ToolResponse(tool_response) => {
-								parts_values.push(json!({
-									"functionResponse": {
-										"name": tool_response.call_id,
-										"response": {
-											"name": tool_response.call_id,
-											"content": content_as_string(&tool_response.content),
-										}
-									}
-								}));
+								parts_values.push(tool_response_parts_to_gemini_function_response(
+									&tool_response.call_id,
+									&tool_response.content,
+								));
 							}
 							ContentPart::ThinkingBlock(_) => {}
 							// Custom are ignored for this logic
@@ -754,17 +749,10 @@ impl GeminiAdapter {
 								}));
 							}
 							ContentPart::ToolResponse(tool_response) => {
-								parts_values.push(json!({
-									"functionResponse": {
-										"name": tool_response.call_id,
-										"response": {
-											"name": tool_response.call_id,
-											// Gemini requires a flat string; stringify structured
-											// content (e.g. Anthropic nested block arrays).
-											"content": content_as_string(&tool_response.content),
-										}
-									}
-								}));
+								parts_values.push(tool_response_parts_to_gemini_function_response(
+									&tool_response.call_id,
+									&tool_response.content,
+								));
 							}
 							ContentPart::ThinkingBlock(block) => {
 								// Gemini-native signed signatures can be forwarded on the Tool role.
@@ -950,6 +938,66 @@ fn take_bool(v: &mut Value, key: &str) -> bool {
 		.and_then(|m| m.remove(key))
 		.and_then(|v| v.as_bool())
 		.unwrap_or(false)
+}
+
+
+/// Build a Gemini `functionResponse` value from a tool response's call_id + Vec<ContentPart>.
+///
+/// Text content flattens into `response.content` (concatenated).
+/// Binary parts (image/PDF/etc) emit as a sibling `parts` array on the functionResponse object,
+/// each part shaped as `{inlineData: {mimeType, data, displayName?}}` for base64 sources or
+/// `{fileData: {fileUri, mimeType}}` for URL sources.
+///
+/// Caveat: Gemini 2.x models do NOT support multi-modal functionResponse (the `parts` field
+/// nested inside functionResponse is a 3.x+ feature). On 2.x this shape errors at the API.
+/// Model-tier-conditional routing is deferred — orual 2026-05-15: "realistically not super
+/// interested in supporting older gemini models."
+fn tool_response_parts_to_gemini_function_response(call_id: &str, parts: &[crate::chat::ContentPart]) -> Value {
+	use crate::chat::{Binary, BinarySource, ContentPart};
+
+	// Partition: text parts → response.content (joined); binary parts → parts[] siblings.
+	let mut text_buf: Vec<String> = Vec::new();
+	let mut multi_parts: Vec<Value> = Vec::new();
+
+	for part in parts {
+		match part {
+			ContentPart::Text(s) => text_buf.push(s.clone()),
+			ContentPart::Binary(Binary { content_type, source, name }) => {
+				let part_value = match source {
+					BinarySource::Base64(data) => {
+						let mut inline = serde_json::Map::new();
+						inline.insert("mimeType".to_string(), json!(content_type));
+						inline.insert("data".to_string(), json!(data));
+						if let Some(n) = name {
+							inline.insert("displayName".to_string(), json!(n));
+						}
+						json!({"inlineData": Value::Object(inline)})
+					}
+					BinarySource::Url(url) => {
+						json!({"fileData": {"fileUri": url, "mimeType": content_type}})
+					}
+				};
+				multi_parts.push(part_value);
+			}
+			// Other variants not meaningful inside tool_response content.
+			ContentPart::ToolCall(_)
+			| ContentPart::ToolResponse(_)
+			| ContentPart::ThinkingBlock(_)
+			| ContentPart::Custom(_) => {}
+		}
+	}
+
+	let content_str = text_buf.join("\n");
+	let mut fr = serde_json::Map::new();
+	fr.insert("name".to_string(), json!(call_id));
+	fr.insert(
+		"response".to_string(),
+		json!({"name": call_id, "content": content_str}),
+	);
+	if !multi_parts.is_empty() {
+		fr.insert("parts".to_string(), Value::Array(multi_parts));
+	}
+	json!({"functionResponse": Value::Object(fr)})
 }
 
 // endregion: --- Helpers

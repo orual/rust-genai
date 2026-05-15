@@ -638,11 +638,14 @@ impl AnthropicAdapter {
 
 									if is_image {
 										match &source {
-											BinarySource::Url(_) => {
-												// As of this API version, Anthropic doesn't support images by URL directly in messages.
-												warn!(
-													"Anthropic doesn't support images from URL, need to handle it gracefully"
-												);
+											BinarySource::Url(url) => {
+												values.push(json!({
+													"type": "image",
+													"source": {
+														"type": "url",
+														"url": url,
+													}
+												}));
 											}
 											BinarySource::Base64(content) => {
 												values.push(json!({
@@ -684,7 +687,7 @@ impl AnthropicAdapter {
 								ContentPart::ToolResponse(tool_response) => {
 									values.push(json!({
 										"type": "tool_result",
-										"content": tool_response.content,
+										"content": tool_response_parts_to_anthropic_value(&tool_response.content),
 										"tool_use_id": tool_response.call_id,
 									}));
 								}
@@ -786,7 +789,7 @@ impl AnthropicAdapter {
 						if let ContentPart::ToolResponse(tool_response) = part {
 							values.push(json!({
 								"type": "tool_result",
-								"content": tool_response.content,
+								"content": tool_response_parts_to_anthropic_value(&tool_response.content),
 								"tool_use_id": tool_response.call_id,
 							}));
 						}
@@ -1020,6 +1023,85 @@ pub struct AnthropicRequestParts {
 	pub system: Option<Value>,
 	pub messages: Vec<Value>,
 	pub tools: Option<Vec<Value>>,
+}
+
+/// Serialize a tool response's Vec<ContentPart> as Anthropic-shaped tool_result content.
+///
+/// Single-Text content emits as `Value::String(text)` — matches Anthropic's
+/// shorthand for text-only tool_result content.
+///
+/// Multi-part or non-Text content emits as `Value::Array` of typed block objects:
+/// - Text → {type: text, text}
+/// - Binary with image/* MIME → {type: image, source: {type: base64, media_type, data} | {type: url, url}}
+/// - Binary with application/pdf MIME → {type: document, source: {type: base64, media_type, data} | {type: url, url}}
+/// - Binary with text/plain MIME → {type: document, source: {type: text, media_type: text/plain, data}}
+/// - Binary with other MIME → {type: document, source: {...}} (best-effort; may fail server-side)
+/// - Non-meaningful ContentPart variants (ToolCall, ToolResponse, ThinkingBlock) are dropped.
+pub(super) fn tool_response_parts_to_anthropic_value(parts: &[crate::chat::ContentPart]) -> serde_json::Value {
+	use crate::chat::{Binary, BinarySource, ContentPart};
+	use serde_json::{Value, json};
+
+	// Shortcut: single Text part → bare string (Anthropic accepts string OR array).
+	if let [ContentPart::Text(s)] = parts {
+		return Value::String(s.clone());
+	}
+
+	let mut blocks: Vec<Value> = Vec::new();
+	for part in parts {
+		match part {
+			ContentPart::Text(s) => blocks.push(json!({"type": "text", "text": s})),
+			ContentPart::Binary(Binary { content_type, source, name: _ }) => {
+				let (block_type, source_value) = if content_type.starts_with("image/") {
+					let src = match source {
+						BinarySource::Base64(data) => json!({
+							"type": "base64",
+							"media_type": content_type,
+							"data": data,
+						}),
+						BinarySource::Url(url) => json!({"type": "url", "url": url}),
+					};
+					("image", src)
+				} else if content_type == "application/pdf" {
+					let src = match source {
+						BinarySource::Base64(data) => json!({
+							"type": "base64",
+							"media_type": content_type,
+							"data": data,
+						}),
+						BinarySource::Url(url) => json!({"type": "url", "url": url}),
+					};
+					("document", src)
+				} else if content_type == "text/plain" {
+					let src = match source {
+						BinarySource::Base64(data) => json!({
+							"type": "text",
+							"media_type": "text/plain",
+							"data": data,
+						}),
+						BinarySource::Url(url) => json!({"type": "url", "url": url}),
+					};
+					("document", src)
+				} else {
+					// Fallback for unknown MIME: emit as document with declared media_type.
+					let src = match source {
+						BinarySource::Base64(data) => json!({
+							"type": "base64",
+							"media_type": content_type,
+							"data": data,
+						}),
+						BinarySource::Url(url) => json!({"type": "url", "url": url}),
+					};
+					("document", src)
+				};
+				blocks.push(json!({"type": block_type, "source": source_value}));
+			}
+			ContentPart::ToolCall(_)
+			| ContentPart::ToolResponse(_)
+			| ContentPart::ThinkingBlock(_)
+			| ContentPart::Custom(_) => {}
+		}
+	}
+	Value::Array(blocks)
 }
 
 // endregion: --- Support
@@ -1310,13 +1392,17 @@ mod tests {
 	fn test_tool_response_array_content_emits_native_json_array_on_wire() {
 		use crate::chat::{ChatMessage, ChatRequest, MessageContent, ToolResponse};
 
-		// Build a ToolResponse whose content is a Value::Array of text blocks —
-		// the shape produced by the segment-3 splice in pattern_runtime.
-		let folded_content = json!([
-			{"type": "text", "text": "seg3 memory context"},
-			{"type": "text", "text": "original tool output"},
-		]);
-		let tool_response = ToolResponse::new_content("toolu_spliced", folded_content);
+		// Build a ToolResponse whose content is a Vec<ContentPart> with two Text parts —
+		// the shape produced by the segment-3 splice in pattern_runtime after the
+		// multi-modal upgrade. tool_response_parts_to_anthropic_value should emit this
+		// as a native JSON array of {type: text, text: ...} blocks on the wire.
+		let tool_response = ToolResponse::from_parts(
+			"toolu_spliced",
+			vec![
+				ContentPart::Text("seg3 memory context".to_string()),
+				ContentPart::Text("original tool output".to_string()),
+			],
+		);
 
 		// Build an assistant(tool_use) + tool(tool_result) message pair.
 		let assistant_msg = ChatMessage::assistant(MessageContent::from_parts(vec![ContentPart::ToolCall(
